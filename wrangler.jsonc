@@ -9,13 +9,13 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "second-brain-db"
+			"database_name": "guesta-brain-db"
 		}
 	],
 	"vectorize": [
 		{
 			"binding": "VECTORIZE",
-			"index_name": "second-brain-vectors"
+			"index_name": "guesta-brain-vectors"
 		}
 	],
 	"ai": {
@@ -23,7 +23,8 @@
 	},
 	"kv_namespaces": [
 		{
-			"binding": "OAUTH_KV"
+			"binding": "OAUTH_KV",
+            "id": "760d2df33b894c9cba06ec4db7fea887"
 		}
 	],
 	"vars": {
