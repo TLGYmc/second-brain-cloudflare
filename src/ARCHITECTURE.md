@@ -22,8 +22,11 @@ Incremental split of the former monolithic `index.ts`. Entry point remains `src/
 | Thresholds, models, chunk/vectorize/recall constants | `constants.ts` |
 | CORS, json, auth | `lib/http.ts` |
 | embed, readStreamText, graceMs | `lib/ai.ts` |
+| actor label resolution | `lib/actors.ts` |
 | initializeDatabase | `db/init.ts` |
 | status/kind tags | `memory/status.ts`, `memory/kind.ts` |
+| tag LIKE pattern + escaping | `memory/tag-sql.ts` |
+| tag vocabulary cache | `tags/vocabulary.ts` |
 | compression eligibility | `compression/eligibility.ts` |
 | chunk, hashtags, temporal, tokenize | `text/*` |
 | cosineSim, rerank, mmr | `recall/math.ts` |
@@ -39,6 +42,7 @@ Incremental split of the former monolithic `index.ts`. Entry point remains `src/
 | MCP server + sanitize | `mcp/*` |
 | REST routes | `routes/*` |
 | dbReady | `runtime/state.ts` |
+| maintenance workspace rotation | `runtime/rotation.ts` |
 
 ## Tests
 
