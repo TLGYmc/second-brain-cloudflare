@@ -302,7 +302,7 @@ const THREE = [row({ id: "a" }), row({ id: "b" }), row({ id: "c" })];
  */
 const SOLO_CARD_CLASS = "memory-card";
 const SOLO_CARD_HTML =
-  "\n<div class=\"card-content\" style=\"cursor: pointer;\">\n  <div class=\"card-title\">Renewal date is 3 March and the contact is Bob</div>\n  \n</div>\n<div class=\"card-footer\">\n  <div class=\"card-meta\">\n    <span class=\"card-source\"><i class=\"ti ti-message-2\"></i>claude</span>\n    <span class=\"card-time\" title=\"FIXED-DATETIME\">1h ago</span>\n  </div>\n  <div class=\"card-tags\"><span class=\"tag-chip\">work</span><span class=\"tag-chip vec-chip vec-chip--off\" title=\"Not vectorized — won\\'t appear in recall\">Not indexed</span></div>\n  <div class=\"card-actions\">\n    <button class=\"card-action-btn append-btn\" onclick=\"openAppend('m1', 'Renewal date is 3 March and the contact is Bob')\"><i class=\"ti ti-writing\"></i> Append</button>\n    <button class=\"card-action-btn edit-btn\"><i class=\"ti ti-pencil\"></i> Edit</button>\n    <div class=\"card-overflow\">\n      <button class=\"card-action-btn overflow-btn\" aria-label=\"More actions\" aria-haspopup=\"true\" aria-expanded=\"false\"><i class=\"ti ti-dots\"></i></button>\n      <div class=\"card-overflow-menu\" hidden>\n        \n        <button class=\"card-overflow-item danger forget-btn\"><i class=\"ti ti-trash\"></i> Forget this memory</button>\n      </div>\n    </div>\n  </div>\n</div>";
+  "\n<div class=\"card-content\" style=\"cursor: pointer;\">\n  <div class=\"card-title\">Renewal date is 3 March and the contact is Bob</div>\n  \n</div>\n<div class=\"card-footer\">\n  <div class=\"card-meta\">\n    <span class=\"card-source\"><i class=\"ti ti-message-2\"></i>claude</span>\n    <span class=\"card-time\" title=\"FIXED-DATETIME\">1h ago</span>\n  </div>\n  <div class=\"card-tags\"><span class=\"tag-chip\">work</span><span class=\"tag-chip vec-chip vec-chip--off\" title=\"Not searchable by meaning yet\">Not indexed</span></div>\n  <div class=\"card-actions\">\n    <button class=\"card-action-btn append-btn\" onclick=\"openAppend('m1', 'Renewal date is 3 March and the contact is Bob')\"><i class=\"ti ti-writing\"></i> Append</button>\n    <button class=\"card-action-btn edit-btn\"><i class=\"ti ti-pencil\"></i> Edit</button>\n    <div class=\"card-overflow\">\n      <button class=\"card-action-btn overflow-btn\" aria-label=\"More actions\" aria-haspopup=\"true\" aria-expanded=\"false\"><i class=\"ti ti-dots\"></i></button>\n      <div class=\"card-overflow-menu\" hidden>\n        \n        <button class=\"card-overflow-item danger forget-btn\"><i class=\"ti ti-trash\"></i> Forget this memory</button>\n      </div>\n    </div>\n  </div>\n</div>";
 
 describe("memories multi-select — the mode", () => {
   it("offers Select on a team brain and keeps the bar down until it is pressed", async () => {
@@ -329,6 +329,20 @@ describe("memories multi-select — the mode", () => {
     expect(el("mem-bulk-bar").style.display).toBe("none");
     expect(el("mem-select-btn").textContent).toBe("Select");
     for (const card of cards()) expect(card.innerHTML).not.toContain("toggleMemorySelection(");
+  });
+
+  // Regression: the checkbox wrapped in an empty <label> with no accessible
+  // name: a screen reader announced "checkbox", not which memory it selects.
+  it("gives every select checkbox an accessible name that identifies its memory", async () => {
+    const { ctx, cards } = setup({ entries: THREE });
+    await ctx.loadRecent();
+    ctx.toggleSelectMode();
+    const labels = cards().map((c: any) => c.innerHTML.match(/<input type="checkbox" aria-label="([^"]*)"/)?.[1]);
+    expect(labels).toEqual([
+      "Select memory: Renewal date is 3 March",
+      "Select memory: Renewal date is 3 March",
+      "Select memory: Renewal date is 3 March",
+    ]);
   });
 });
 
@@ -616,6 +630,18 @@ describe("bulk layer move — the question", () => {
     expect(h.el("confirm-accept-btn").textContent).toBe("Make private");
   });
 
+  // Sharing or unsharing is reversible in one tap either way, not a delete:
+  // the sheet used to render every caller red/danger regardless of severity,
+  // which told the truth about "Forget" and lied about this one.
+  it("renders the accept button as primary, not danger, for both directions of a reversible move", async () => {
+    const h = await selected({ entries: THREE }, ["a"]);
+    h.ctx.confirmBulkLayerMove("company");
+    expect(h.el("confirm-accept-btn").className).toBe("btn-primary confirm-accept-primary");
+
+    h.ctx.confirmBulkLayerMove("personal");
+    expect(h.el("confirm-accept-btn").className).toBe("btn-primary confirm-accept-primary");
+  });
+
   it("opens no sheet on an empty selection", async () => {
     const h = await selected({ entries: THREE }, []);
     const before = h.generation();
@@ -823,7 +849,7 @@ describe("bulk layer move — partial success", () => {
     await h.settle();
 
     expect(h.shareCalls.map((c) => c.id), "all three are attempted").toEqual(["a", "b", "c"]);
-    expect(h.toast()).toContain("2 moved · 1 refused — still selected");
+    expect(h.toast()).toContain("2 moved · 1 refused and still selected");
     expect(h.selection()).toEqual(["b"]);
     expect(
       h.cards().filter((c: any) => c.className.includes("memory-card--selected")).map((c: any) => c.dataset.id),
@@ -857,7 +883,7 @@ describe("bulk layer move — partial success", () => {
     await h.settle();
 
     expect(h.shareCalls.map((c) => c.id), "all three are attempted").toEqual(["a", "b", "c"]);
-    expect(h.toast()).toContain("1 moved · 2 refused — still selected");
+    expect(h.toast()).toContain("1 moved · 2 refused and still selected");
     expect(h.selection(), "the refusal and the network failure, and not the success").toEqual(["b", "c"]);
     expect(
       h.cards().filter((c: any) => c.className.includes("memory-card--selected")).map((c: any) => c.dataset.id),
@@ -895,7 +921,7 @@ describe("bulk layer move — error propagation", () => {
 
     expect(h.shareCalls.map((c) => c.id), "rows 1 and 3 are still attempted").toEqual(["a", "b", "c"]);
     expect(h.sheetOpen(), "done() ran").toBe(false);
-    expect(h.toast()).toContain("2 moved · 1 refused — still selected");
+    expect(h.toast()).toContain("2 moved · 1 refused and still selected");
     expect(h.selection()).toEqual(["b"]);
 
     // The sheet's rule 1 is "close, or re-enable, but never fall off the end
@@ -918,7 +944,7 @@ describe("bulk layer move — Italian", () => {
     expect(h.el("confirm-title").textContent).toBe("Condividere 3 ricordi col team?");
     await h.ctx.runConfirmAction();
     await h.settle();
-    expect(h.toast()).toContain("2 spostati · 1 rifiutato — resta selezionato");
+    expect(h.toast()).toContain("2 spostati · 1 rifiutato, resta selezionato");
   });
 
   it("reports a batch that moved nothing with a verb, like the rest of the block", async () => {

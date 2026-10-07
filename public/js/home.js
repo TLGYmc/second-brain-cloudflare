@@ -242,7 +242,18 @@ async function submitHome() {
     while ((m = tagRe.exec(text)) !== null) tags.push(m[1])
     const content = text.replace(/#[a-zA-Z][\w-]*/g, '').trim() || text
 
-    const result = await apiCapture(content, tags, 'web-ui', homeLayer)
+    const result = await apiCapture(content, tags, 'web-ui', homeLayer, selectedComposerProject())
+    // Rejected before anything is cleared: the too-large reply promises "your
+    // text is still here", so the field keeps it exactly like a network
+    // failure below does, and this is not a receipt (nothing was stored).
+    if (result && result.ok === false && result.error === 'too_large') {
+      // Not .receipt/.receipt-headline: that pairing is set in the dashboard's
+      // monospace receipt font, right for a short status word like "stored to
+      // brain" and wrong for a full sentence, which read like a debug log.
+      // The same inline-error treatment settings' save error uses instead.
+      receipts.innerHTML = `<p class="inline-error">${escHtml(t('home.tooLong'))}</p>`
+      return
+    }
     field.value = ''
     autoResize(field)
     if (result.duplicate) {
@@ -250,6 +261,26 @@ async function submitHome() {
     } else {
       receipts.innerHTML = ''
       receipts.appendChild(captureReceipt(result, tags))
+      // A fresh capture has no earlier version, so "Undo" here means forget
+      // rather than the usual POST /undo, and the toast that follows says so.
+      if (result.id && typeof showToast === 'function') {
+        showToast(t('undo.saved'), {
+          action: t('history.undo'),
+          onAction: async () => {
+            try {
+              await fetch(`${WORKER_URL}/forget`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({ id: result.id }),
+              })
+              showToast(t('undo.trashed'))
+              refreshAll()
+            } catch (e) {
+              showToast(e.message || t('team.actionFailed'))
+            }
+          },
+        })
+      }
     }
     // Outside the try: a refresh hiccup must never rewrite a successful
     // capture's receipt as "could not save" — that lie cost a user trust once.
@@ -262,7 +293,7 @@ async function submitHome() {
   }
 }
 
-/** Home gives way to the conversation, and the brief goes with it. */
+/** Home gives way to the conversation, and the brief and board go with it. */
 function leaveHome() {
   // Without dropping this class the old input bar stays hidden and the
   // conversation has nothing to type into.
@@ -272,6 +303,10 @@ function leaveHome() {
   if (home) home.style.display = 'none'
   const brief = document.getElementById('brief')
   if (brief) brief.style.display = 'none'
+  const boardTiles = document.getElementById('board-tiles')
+  if (boardTiles) boardTiles.style.display = 'none'
+  const board = document.getElementById('board')
+  if (board) board.style.display = 'none'
 }
 
 /**
@@ -285,6 +320,10 @@ function returnHome() {
   if (screen) screen.classList.add('home-visible')
   const home = document.getElementById('home')
   if (home) home.style.display = ''
+  const boardTiles = document.getElementById('board-tiles')
+  if (boardTiles) boardTiles.style.display = ''
+  const board = document.getElementById('board')
+  if (board) board.style.display = ''
 
   // A fresh start, so the field makes no claim about a sentence nobody has
   // written yet — coming back from a question otherwise left "will search"
@@ -316,8 +355,6 @@ function greetingFor(date) {
 
 /** Fills the greeting and the one number worth putting above the input. */
 function renderHome(data) {
-  const screen = document.getElementById('screen-home')
-  if (screen) screen.classList.add('home-visible')
   const greet = document.getElementById('home-greeting')
   if (greet) greet.textContent = greetingFor(new Date())
 

@@ -1,31 +1,40 @@
+import { hasCapsuleTag } from "../tags/system";
+import { deleteEntryVectors, persistPendingVectorDeletes } from "../vectorize/batch";
 import type { Env } from "../env";
 import { readOverrides, resetOverride, resolveConfig } from "../config";
 import { SB_VERSION } from "../env";
 import { COMPRESSION_MIN_AGE_MS, compressionEligibilitySql, isTopicTagSql } from "../compression/eligibility";
 import { intParam, json } from "../lib/http";
-import { D1_MAX_BOUND_PARAMS, VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY } from "../constants";
+import { D1_MAX_BOUND_PARAMS, VECTORIZE_DELETE_MAX_IDS_PER_CALL, VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY, VERSIONS_SINCE_KV_KEY } from "../constants";
 import { requireAdmin, requireIdentity, type Identity } from "../lib/identity";
-import { effectiveWriteTarget, layerOf, primaryCompanyWorkspaceId, scopeWhere } from "../lib/scope";
+import { effectiveWriteTarget, layerOf, primaryCompanyWorkspaceId, readableWorkspaces, scopeWhere, scopeWhereForIdRead } from "../lib/scope";
 import { lookupActorLabels, resolveActorLabel } from "../lib/actors";
 import { ensureTenantBootstrap } from "../lib/tenancy";
 import { graceMs } from "../lib/ai";
 import { classifyEntry } from "../capture/classify";
-import { storeEntry } from "../capture/store";
+import { PENDING_WHERE, indexPendingRow, type PendingRow } from "../vectorize/pending";
 import { INDEXABLE_SQL } from "../capture/lifecycle";
 import { PENDING_INSIGHT_SQL } from "../memory/patterns";
-import { STALE_REVIEW_SQL, hasStaleAsOf, withoutStaleAsOf } from "../memory/stale";
+import { STALE_REVIEW_SQL, hasStaleAsOf, withoutStaleAsOf, staleReasonFor } from "../memory/stale";
+import { openLoopSql, withTaskDone, withoutTask } from "../memory/loops";
+import { openOutboundSql, openInboundSql, directionOf, counterpartyOf, dueKindOf } from "../commitments/direction";
 import { getStatus, withStatus } from "../memory/status";
 import { assertCanEditContent, getReadableEntry } from "../lib/entry-access";
 import { withKind } from "../memory/kind";
 import { checkVectorizeHealth } from "../vectorize/health";
 import { vectorizeFilterState } from "../vectorize/scope";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
+import { notHeldSqlFor } from "../quarantine/tags";
 import { reasonOverPair, restatesRecent } from "../insight/reason";
 import { MAX_INSIGHTS_PER_RUN, RECENT_INSIGHT_WINDOW, rawInsightText } from "../insight/weekly";
 import { runInsightAccrual, isEligiblePair, parseTags } from "../insight/candidates";
 import { adminAuditEvent } from "../lib/admin-audit";
-import { auditEvents, type AuditEventInput } from "../lib/audit";
+import { auditEvent, auditEvents, type AuditEventInput } from "../lib/audit";
+import { resolveEntryAction, applyInsightResolution } from "../memory/actions";
 import { createMember, listMembers, listRoster, listTeamWorkspaces, lookupAuditNames, removeMember, renameTeamWorkspace, rotateMemberToken, setMemberDefaultShare, setMemberProfile, setMemberSuspended, isTeamBrain, TeamAdminError } from "../lib/team-admin";
+import { readNightSummary, type NightSummary } from "../runtime/night-summary";
+import { readWhenCursor, fetchWhenCandidates, judgeCommitment } from "../when/pass";
+import { DUE_WITHIN_MS, dueSql, parseExplicitWhen } from "../when/input";
 
 /**
  * Ids accepted by one bulk resolve. D1 allows 100 bound parameters per
@@ -39,6 +48,11 @@ import { createMember, listMembers, listRoster, listTeamWorkspaces, lookupAuditN
 
 /** How many nodes the degree ranking returns: a ranking, not a dump of the graph. */
 const GRAPH_STATS_TOP_DEGREE = 20;
+
+/** Rows per bucket on GET /due — a feed, not a full export. */
+const DUE_FEED_LIMIT = 20;
+/** How much of an entry's content GET /due and GET /extract/dry-run print. */
+const DUE_CONTENT_CHARS = 200;
 
 export async function handleAdminRoutes(
   request: Request,
@@ -101,7 +115,7 @@ export async function handleAdminRoutes(
       // override without turning it into a permanent "on" override.
       const overrides = await readOverrides(env);
       if (overrides.TEAM_MODE === "off") await resetOverride(env, "TEAM_MODE").catch(() => {});
-      // The token is returned exactly once — only its hash is stored.
+      // The token is returned exactly once, only its hash is stored.
       return json({ ok: true, member, token }, 201);
     } catch (e) {
       if (e instanceof TeamAdminError) return json({ ok: false, error: e.message }, e.status);
@@ -154,7 +168,7 @@ export async function handleAdminRoutes(
     }
   }
 
-  // POST /team/members/default-share — per-member capture-visibility override.
+  // POST /team/members/default-share, per-member capture-visibility override.
   // "inherit" clears it; the org-level default lives in config
   // (TEAM_DEFAULT_WORKSPACE) and is what "inherit" falls back to.
   if (url.pathname === "/team/members/default-share" && request.method === "POST") {
@@ -183,7 +197,7 @@ export async function handleAdminRoutes(
     }
   }
 
-  // POST /team/me/default-share — a member's own capture-visibility override.
+  // POST /team/me/default-share, a member's own capture-visibility override.
   //
   // requireIdentity, and the body has NO id field. That is the security
   // property: the admin route above takes a target and must therefore be gated
@@ -194,7 +208,7 @@ export async function handleAdminRoutes(
   //
   // Returns the three recomputed fields rather than { ok: true } so the caller
   // re-renders from the server's own precedence answer instead of predicting
-  // it — the same drift GET /team/me's effectiveDefault exists to prevent.
+  // it, the same drift GET /team/me's effectiveDefault exists to prevent.
   if (url.pathname === "/team/me/default-share" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
@@ -205,7 +219,7 @@ export async function handleAdminRoutes(
     }
     // setMemberDefaultShare throws TeamAdminError(404) when no row changed, and
     // that cannot happen here: requireIdentity already resolved this row. No
-    // try/catch — the same argument GET /team/me's unreachable 404 records
+    // try/catch, the same argument GET /team/me's unreachable 404 records
     // above. If the invariant ever breaks, it should reach the 500 handler.
     await setMemberDefaultShare(env, auth.userId, body.default);
     const orgDefault = cfg.TEAM_DEFAULT_WORKSPACE === "company" ? "company" : "personal";
@@ -228,7 +242,7 @@ export async function handleAdminRoutes(
     });
   }
 
-  // POST /team/members/remove — soft offboarding. Marks the member removed,
+  // POST /team/members/remove, soft offboarding. Marks the member removed,
   // deletes the personal workspace and everything in it; company-layer entries
   // the member authored stay (they are shared memory now). Guardrails inside
   // removeMember: not self, not the last active admin. The confirmation UX is
@@ -241,9 +255,17 @@ export async function handleAdminRoutes(
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
     try {
       const result = await removeMember(env, auth.userId, body.id.trim());
+      // History remains: nothing is audited or deleted from the index yet. The dashboard calls
+      // again, and the nightly run resumes it if nobody does.
+      // FX3 finding 7: keeps the 3.7 removedEntries/removedVectors fields on the 202 too, rather
+      // than omitting them — both are genuinely 0 at this stage, since removeMember touches
+      // neither D1 rows nor vectors until the history cleanup finishes and done flips true.
+      if (!result.done) {
+        return json({ ok: true, done: false, id: body.id.trim(), remaining: result.remaining, removedEntries: 0, removedVectors: 0 }, 202);
+      }
       // Audited before the Vectorize delete, not after: the D1 rows are already
       // gone by here, so a Vectorize failure must not also cost the record of the
-      // destruction. The counts, never the content — this is the one
+      // destruction. The counts, never the content, this is the one
       // administration action that destroys memories, so how many is what a later
       // reader needs.
       adminAuditEvent(env, ctx, {
@@ -252,25 +274,35 @@ export async function handleAdminRoutes(
         event: "member_removed",
         payload: { removedEntries: result.removedEntries, removedVectors: result.vectorIds.length },
       });
+      // Capped (FX3 finding 2): a removed member's vectors can run into the tens of thousands, and
+      // an uncapped delete can exceed the platform's subrequest ceiling before anything is deleted.
+      // removedVectors defaults to the full intended count (unchanged on success or on a Vectorize
+      // failure, matching the existing "report the truth about the D1-side removal" contract below)
+      // and is trimmed only when the cap left something for the nightly drain to queue and finish.
+      let removedVectors = result.vectorIds.length;
       if (result.vectorIds.length) {
         try {
-          await env.VECTORIZE.deleteByIds(result.vectorIds);
+          const deletion = await deleteEntryVectors(env, result.ownedVectors, { maxIds: VECTORIZE_DELETE_MAX_IDS_PER_CALL });
+          if (!deletion.done) {
+            removedVectors -= deletion.remaining.reduce((n, o) => n + o.vectorIds.length, 0);
+            await persistPendingVectorDeletes(env, deletion.remaining);
+          }
         } catch (e) {
           // The D1 rows and the audit row are already committed: the removal
-          // succeeded. A failed index delete only leaves dead vectors behind —
-          // the same degradation /patterns/resolve accepts — so the admin sees
+          // succeeded. A failed index delete only leaves dead vectors behind,
+          // the same degradation /patterns/resolve accepts, so the admin sees
           // the truth (member removed) instead of a 500 for work that happened.
           console.error("Vectorize deleteByIds failed during member removal (non-fatal):", e);
         }
       }
-      return json({ ok: true, id: body.id.trim(), removedEntries: result.removedEntries, removedVectors: result.vectorIds.length });
+      return json({ ok: true, done: true, id: body.id.trim(), removedEntries: result.removedEntries, removedVectors });
     } catch (e) {
       if (e instanceof TeamAdminError) return json({ ok: false, error: e.message }, e.status);
       throw e;
     }
   }
 
-  // GET /team/me — caller's own profile row (any signed-in identity).
+  // GET /team/me, caller's own profile row (any signed-in identity).
   if (url.pathname === "/team/me" && request.method === "GET") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
@@ -279,23 +311,23 @@ export async function handleAdminRoutes(
     ).bind(auth.userId).first<{ userId: string; name: string; email: string | null; role: string }>();
     // Unreachable through a bearer token, and kept anyway. IDENTITY_SQL and
     // IDENTITY_BY_ID_SQL (src/lib/identity.ts) both exclude suspended and removed
-    // users, so a caller who got past requireIdentity always has a row here — a
+    // users, so a caller who got past requireIdentity always has a row here, a
     // removed member gets 401 from the auth layer, never this 404. The
     // unreachability is therefore an invariant maintained in a DIFFERENT file:
     // deleting this branch would trade one line for a non-null assertion or a
     // crash if that invariant ever loosened, so it stays and fails closed.
-    // Do not write a test for this 404 through the HTTP surface — the state it
+    // Do not write a test for this 404 through the HTTP surface, the state it
     // guards cannot be reached from one.
     if (!row) return json({ ok: false, error: "Not found" }, 404);
     // Where this member's next capture lands, and the two inputs that decided
-    // it. All three are additive — the four fields above keep their names and
+    // it. All three are additive, the four fields above keep their names and
     // values, so loadProfileName() in public/js/settings.js is untouched.
     //
     // TEAM_DEFAULT_WORKSPACE is a free-text config key, so it is narrowed to the
     // enum here rather than passed through: anything that is not "company" is
     // private-by-default, matching effectiveWriteTarget's own reading of it.
     const orgDefault = cfg.TEAM_DEFAULT_WORKSPACE === "company" ? "company" : "personal";
-    // Who owns the deployment — the one thing `role` cannot say. tenancy.ts
+    // Who owns the deployment, the one thing `role` cannot say. tenancy.ts
     // hashes this brain's AUTH_TOKEN into a users row with role 'admin'
     // (invariant 4), and rowToIdentity narrows role to "admin" | "member", so
     // the person who created the brain and a colleague they promoted are the
@@ -317,7 +349,7 @@ export async function handleAdminRoutes(
         // Consumed by installer/src-tauri/src/commands.rs::connection_role,
         // which hands it to installer/src/connection-role.ts.
         owner: row.userId === roots.ownerUserId,
-        // Already on the resolved Identity — no second column read, no second query.
+        // Already on the resolved Identity, no second column read, no second query.
         defaultShare: auth.defaultShare,
         orgDefault,
         // Resolved by the same function the write path calls (src/lib/scope.ts),
@@ -330,7 +362,7 @@ export async function handleAdminRoutes(
     });
   }
 
-  // GET /team/workspaces — the teams the caller belongs to, with names.
+  // GET /team/workspaces, the teams the caller belongs to, with names.
   //
   // Open to every member, not just admins: the name is how a member knows which
   // company they are sharing into, and the dashboard shows it in the sidebar for
@@ -346,14 +378,14 @@ export async function handleAdminRoutes(
     });
   }
 
-  // POST /team/workspaces/rename — name a team. Admin-only.
+  // POST /team/workspaces/rename, name a team. Admin-only.
   if (url.pathname === "/team/workspaces/rename" && request.method === "POST") {
     const auth = await requireAdmin(request, env);
     if (auth instanceof Response) return auth;
     let body: { id?: string; name?: string };
     try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-    // Defaults to the caller's primary team so a single-team brain — every brain
-    // today — need not know its own workspace id to name itself.
+    // Defaults to the caller's primary team so a single-team brain, every brain
+    // today, need not know its own workspace id to name itself.
     const id = body.id?.trim() || primaryCompanyWorkspaceId(auth);
     // An admin of one company cannot rename another's: the id has to be a team
     // this caller is actually in.
@@ -378,7 +410,7 @@ export async function handleAdminRoutes(
     }
   }
 
-  // POST /team/profile — rename self, or any member when caller is admin.
+  // POST /team/profile, rename self, or any member when caller is admin.
   if (url.pathname === "/team/profile" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
@@ -390,8 +422,8 @@ export async function handleAdminRoutes(
     }
     try {
       await setMemberProfile(env, targetId, { name: body.name, email: body.email });
-      // `self` separates a member renaming themselves — routine, and the common
-      // case — from an admin renaming someone else, which is administration.
+      // `self` separates a member renaming themselves, routine, and the common
+      // case, from an admin renaming someone else, which is administration.
       // The new name and email are omitted: they are member-supplied content.
       adminAuditEvent(env, ctx, {
         actorId: auth.userId,
@@ -406,7 +438,7 @@ export async function handleAdminRoutes(
     }
   }
 
-  // GET /team/activity — the compliance feed. Two INSERT-only trails, one
+  // GET /team/activity, the compliance feed. Two INSERT-only trails, one
   // time-ordered answer.
   //
   // WHAT EACH ARM GUARANTEES, stated exactly rather than implied. A comment
@@ -419,7 +451,7 @@ export async function handleAdminRoutes(
   //    the memory it names is one this caller could read through GET /entry.
   //    Nothing about an unreadable memory is emitted: not its text, not its
   //    id, not its actor, and not the target workspace id in `detail`. That
-  //    last one is why a title-only predicate was not enough — a row hidden in
+  //    last one is why a title-only predicate was not enough, a row hidden in
   //    one column and disclosed in three others is not scoped, and
   //    listTeamWorkspaces binds only the caller's own workspace ids, so
   //    another company's id is reachable nowhere else on this deployment.
@@ -428,7 +460,7 @@ export async function handleAdminRoutes(
   //    column, so the joined entry is the only thing that can attribute a row.
   //    Share/unshare history for a memory that has since been DELETED can no
   //    longer be attributed and therefore DOES NOT APPEAR in this feed. The two
-  //    ways to keep it are both worse — a workspace column on entry_events is
+  //    ways to keep it are both worse, a workspace column on entry_events is
   //    blank for every row already written, and a second unscoped join proving
   //    the id is dead would disclose "some deleted memory was shared to
   //    ws-companyY" to an admin of company X. The per-entry trail
@@ -439,8 +471,8 @@ export async function handleAdminRoutes(
   //    admin_events.workspace_id is populated only by `team_renamed`; every
   //    member event stores "". So on a deployment with two companies, an admin
   //    of one sees the other's member events. That is accepted, not overlooked:
-  //    it is exactly as wide as GET /team/members already is — listMembers is
-  //    scope-exempt with no membership filter — so it adds NO new exposure.
+  //    it is exactly as wide as GET /team/members already is, listMembers is
+  //    scope-exempt with no membership filter, so it adds NO new exposure.
   //    Narrowing it would mean stamping workspace_id on every admin event from
   //    here on, which cannot repair rows already written, and would leave a feed
   //    that is narrow for new rows and wide for old ones.
@@ -455,7 +487,7 @@ export async function handleAdminRoutes(
   // this surface specifically, for three reasons:
   //
   //  1. Every degradation available to this route is a LIE. Answering
-  //     `{ ok: true, events: [] }` says nothing happened — public/js/activity.js
+  //     `{ ok: true, events: [] }` says nothing happened, public/js/activity.js
   //     states the principle in its own words, "an empty audit log is not an
   //     empty result, it is a claim that nothing happened". Answering the rows
   //     with the names dropped is no better: `actor` is defined on this wire as
@@ -467,7 +499,7 @@ export async function handleAdminRoutes(
   //     (public/js/activity.js). That is the same information, shown to the
   //     person who can act on it, without the server asserting anything false.
   //  3. No route in this worker is individually wrapped, and a catch here alone
-  //     would be a local exception with no principle behind it — the next
+  //     would be a local exception with no principle behind it, the next
   //     reader would copy it onto a route where swallowing IS wrong.
   //
   // So the disposal for the bound-parameter defect that raised the question is
@@ -480,7 +512,7 @@ export async function handleAdminRoutes(
   //
   // requireAdmin, not requireIdentity: the feed names who suspended whom, which
   // is administration and not a peer fact. The gate authorises this SURFACE and
-  // widens nothing about which memory rows may be read — that is the scope
+  // widens nothing about which memory rows may be read, that is the scope
   // clause's job, below.
   if (url.pathname === "/team/activity" && request.method === "GET") {
     const auth = await requireAdmin(request, env);
@@ -510,20 +542,31 @@ export async function handleAdminRoutes(
     // group the sorter may emit in any order is how a row lands on two pages or
     // on none. `event_id` is each trail's own primary key, unique within its
     // table and a UUID across both, so `created_at DESC, event_id DESC` is a
-    // total order — arbitrary within a tie, but the SAME arbitrary order for
+    // total order, arbitrary within a tie, but the SAME arbitrary order for
     // every page of the same data, which is the whole requirement. It is
     // projected only to be sorted on; the response does not carry it.
+    //
+    // Round 3 re-review MAJOR: a reused id's earlier life always ends with a "purged" event or a
+    // "deleted" event with payload.trash false (tier 3) -- everything at or before the LATEST such
+    // end event for this id belongs to whoever's row is now gone, not the live row just joined in
+    // below. The extra AND clause is rowid, not created_at: insertion order is the true order this
+    // Worker wrote these two events in, whatever either one's own created_at claims.
+    // First conjunct matches idx_entry_events_life_end's own WHERE syntactically (no json_extract
+    // in the index) -- see src/brief/changes.ts's lifeFilter for the full reasoning.
     const { results } = await env.DB.prepare(
       `SELECT 'admin' AS kind, ae.id AS event_id, ae.event AS event, ae.actor_id AS actor_id,
               ae.target_user_id AS subject_id, '' AS entry_id, NULL AS title,
               ae.payload AS payload, ae.created_at AS created_at
          FROM admin_events ae
+        WHERE substr(ae.event, 1, 8) <> 'project_'
        UNION ALL
        SELECT 'entry', ev.id, ev.event, ev.actor_id, '', ev.entry_id,
               substr(m.content, 1, 160), ev.payload, ev.created_at
          FROM entry_events ev
          JOIN entries m ON m.id = ev.entry_id AND m.${scope.clause}
         WHERE ev.event IN ('shared', 'unshared', 'insight_confirmed', 'insight_dismissed')
+          AND ev.rowid > COALESCE((SELECT MAX(g.rowid) FROM entry_events g WHERE g.entry_id = ev.entry_id
+                AND g.event IN ('purged', 'deleted') AND (g.event = 'purged' OR json_extract(g.payload, '$.trash') = 0)), 0)
        ORDER BY created_at DESC, event_id DESC
        LIMIT ? OFFSET ?`,
     ).bind(...scope.bindings, limit, offset).all();
@@ -531,7 +574,7 @@ export async function handleAdminRoutes(
     const rows = results as Record<string, unknown>[];
     // Resolved once for the page, and through lookupAuditNames rather than
     // listRoster: see that function. `actor` and `subject` are NAMES OR NULL,
-    // never ids — the rule Phase 2 established for the roster and Phase 3 for
+    // never ids, the rule Phase 2 established for the roster and Phase 3 for
     // connectedBy, applied to every people-shaped field this codebase publishes.
     const names = await lookupAuditNames(env, rows.flatMap((r) =>
       [String(r.actor_id ?? ""), String(r.subject_id ?? "")]));
@@ -571,13 +614,13 @@ export async function handleAdminRoutes(
     // scopes, which is why the first query carries the scope as a CASE rather
     // than a WHERE.
     //
-    //  - Deployment health — `unvectorized`, `unclassified`, `digest_candidates`
-    //    — stays corpus-wide. They drive repairs (POST /vectorize-pending,
+    //  - Deployment health, `unvectorized`, `unclassified`, `digest_candidates`
+    //   , stays corpus-wide. They drive repairs (POST /vectorize-pending,
     //    /classify-pending) and the nightly compression pass, all of which act on
     //    every workspace, so a scoped count would under-report the work and leave
     //    rows unrepairable with no sign of it.
     //
-    //  - "What is my brain about" — `count`, `avg_importance`, `top_tags` — is
+    //  - "What is my brain about", `count`, `avg_importance`, `top_tags`, is
     //    content, and is scoped to the admin's own readable set. Unscoped, it
     //    reported colleagues' memories as the admin's own: `brain stats` in the
     //    CLI prints `top_tags` under "Top tags", so an admin's terminal listed
@@ -589,7 +632,7 @@ export async function handleAdminRoutes(
         // unvectorized skips deprecated entries: their vectors were deleted
         // deliberately, so counting them here offered the user a repair for
         // something that is not broken.
-        // scope-exempt: the row set here is deliberately corpus-wide — unvectorized and unclassified are deployment repair counters and would under-report if narrowed (see the block comment above and team-isolation.test.ts). The caller's clause is applied INSIDE the CASE for count/avg_importance, which scopes those two numbers and not the rows read; that is why it is spelled as a CASE and not a WHERE
+        // scope-exempt: the row set here is deliberately corpus-wide, unvectorized and unclassified are deployment repair counters and would under-report if narrowed (see the block comment above and team-isolation.test.ts). The caller's clause is applied INSIDE the CASE for count/avg_importance, which scopes those two numbers and not the rows read; that is why it is spelled as a CASE and not a WHERE
         `SELECT
            SUM(CASE WHEN ${scope.clause} THEN 1 ELSE 0 END) as count,
            AVG(CASE WHEN ${scope.clause} THEN importance_score END) as avg_importance,
@@ -604,16 +647,14 @@ export async function handleAdminRoutes(
       // raised because the filter now discards rows the ORDER BY ranked first.
       env.DB.prepare(
         `SELECT value, COUNT(*) as n FROM entries, json_each(entries.tags)
-         WHERE value NOT LIKE 'kind:%' AND value NOT LIKE 'status:%'
-           AND value NOT LIKE 'volatility:%' AND value NOT LIKE 'stale:%'
-           AND value NOT IN ('auto-pattern', 'auto-insight', 'synthesized', 'rolled-up', 'duplicate-candidate')
+         WHERE ${isTopicTagSql()}
            AND value NOT GLOB '[0-9]*'
            AND ${scope.clause}
          GROUP BY value ORDER BY n DESC LIMIT 5`,
       ).bind(...scope.bindings).all(),
       // Scoped like top_tags directly above, and for the same reason: this list
       // is tag NAMES, and it is rendered on the admin's dashboard. Unscoped it
-      // named colleagues' private topics — "divorce-paperwork" beside a count —
+      // named colleagues' private topics, "divorce-paperwork" beside a count,
       // from workspaces the same token gets a 404 from /entry for. The nightly
       // compression pass picks its own tags per workspace (src/compression), so
       // narrowing this display list costs no repair coverage.
@@ -658,7 +699,7 @@ export async function handleAdminRoutes(
     });
   }
 
-  // GET /stats/graph — the edge-quality audit surface. The type histogram is a
+  // GET /stats/graph, the edge-quality audit surface. The type histogram is a
   // single grouped scan and always runs; the endpoint join, the degree ranking
   // and the capture-gap histogram each cost their own pass over a table, so an
   // operator polling the cheap half does not pay for them unless ?deep=1.
@@ -666,7 +707,7 @@ export async function handleAdminRoutes(
   // ?deep=1 IS A MANUAL AUDIT. DO NOT SCHEDULE OR POLL IT.
   //
   // edges has no index on workspace_id, so a deep call is four full scans of
-  // the edge table plus two indexed endpoint seeks per edge — around 5M row
+  // the edge table plus two indexed endpoint seeks per edge, around 5M row
   // visits at roughly 800k edges, which is D1's entire free daily allowance.
   // Spending it fails every query on the ACCOUNT, not just this route, until
   // 00:00 UTC. Run it by hand a few times, not on a timer.
@@ -707,21 +748,21 @@ export async function handleAdminRoutes(
     // edge as broken for an admin who cannot read its workspace, and count a
     // genuinely corrupt cross-workspace edge as fine for one who can. And it
     // costs no bindings, where repeating the scope list twice more put this
-    // statement at 3x the workspace count — past D1's 100-parameter ceiling for
+    // statement at 3x the workspace count, past D1's 100-parameter ceiling for
     // an admin in ~32 teams, which fails the whole request rather than
     // degrading.
     //
     // It stays scoped for privacy by the outer clause: only edges the caller
     // may read are counted at all.
     const invalidEndpoints = await env.DB.prepare(
-      // scope-exempt: the entries reads are existence checks bound to edges.workspace_id, and the outer clause already limits the counted rows to edges the caller may read — so neither can reach or probe for an entry outside the caller's scope
+      // scope-exempt: the entries reads are existence checks bound to edges.workspace_id, and the outer clause already limits the counted rows to edges the caller may read, so neither can reach or probe for an entry outside the caller's scope
       `SELECT COUNT(*) AS n FROM edges
        WHERE ${edgeScope.clause}
          AND (NOT EXISTS (SELECT 1 FROM entries WHERE entries.id = edges.source_id AND entries.workspace_id = edges.workspace_id)
            OR NOT EXISTS (SELECT 1 FROM entries WHERE entries.id = edges.target_id AND entries.workspace_id = edges.workspace_id))`,
     ).bind(...edgeScope.bindings).first() as Record<string, any> | null;
 
-    // Both endpoints count, so a self-edge scores 2 — the same expansion a walk
+    // Both endpoints count, so a self-edge scores 2, the same expansion a walk
     // from that node would see.
     const degreeRows = await env.DB.prepare(
       `SELECT id, COUNT(*) AS degree FROM (
@@ -770,7 +811,130 @@ export async function handleAdminRoutes(
     });
   }
 
-  // GET /health — index/runtime health, used by the dashboard banner, the
+  // GET /stats/activity, per-source capture volume over N days, for the
+  // dashboard's growth chart. Per-caller, not admin (see the /patterns
+  // precedent above): same shape as GET /brief's activity strip, widened to
+  // bucket by source as well as by day.
+  if (url.pathname === "/stats/activity" && request.method === "GET") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    const days = intParam(url, "days", { fallback: 90, min: 7, max: 365 });
+    if (days instanceof Response) return days;
+
+    const scope = scopeWhere(auth);
+    const now = Date.now();
+    const since = now - days * 86400000;
+    // Uses idx_entries_workspace_created: the workspace predicate seeks, the
+    // created_at cutoff range-scans from there, the same cost class as
+    // GET /brief's activity query. One statement, pivoted into per-source
+    // series below.
+    const { results } = await env.DB.prepare(
+      `SELECT source, CAST(created_at / 86400000 AS INTEGER) AS day, COUNT(*) AS n
+       FROM entries WHERE created_at >= ? AND ${scope.clause}
+       GROUP BY source, day`,
+    ).bind(since, ...scope.bindings).all();
+
+    const today = Math.floor(now / 86400000);
+    const start = today - (days - 1);
+    const bySource = new Map<string, Map<number, number>>();
+    for (const r of results as { source: string | null; day: number; n: number }[]) {
+      const source = r.source ?? "unknown";
+      const byDay = bySource.get(source) ?? new Map<number, number>();
+      byDay.set(r.day, Number(r.n));
+      bySource.set(source, byDay);
+    }
+
+    const series = [...bySource.entries()]
+      .map(([source, byDay]) => {
+        const counts: number[] = [];
+        for (let d = start; d <= today; d++) counts.push(byDay.get(d) ?? 0);
+        return { source, counts, total: counts.reduce((a, b) => a + b, 0) };
+      })
+      .sort((a, b) => b.total - a.total)
+      .map(({ source, counts }) => ({ source, counts }));
+
+    return json({ ok: true, days, start, series });
+  }
+
+  // GET /stats/recalled, the dashboard's "most recalled" panel. No index on
+  // recall_count: ORDER BY ... LIMIT sorts the caller's own scoped rows
+  // (already narrowed to the caller by idx_entries_workspace_created's
+  // leading column) once per dashboard open, which the worker cookbook
+  // accepts as a cost at this scale. Do not add an index for this alone.
+  if (url.pathname === "/stats/recalled" && request.method === "GET") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    const limit = intParam(url, "limit", { fallback: 5, min: 1, max: 20 });
+    if (limit instanceof Response) return limit;
+
+    const scope = scopeWhere(auth);
+    // Same exclusions as /stats' digest-candidate query above: rollups,
+    // proposed patterns and insights are not "your own" recalled memories.
+    const exclusions = `tags NOT LIKE '%"rolled-up"%'
+       AND tags NOT LIKE '%"synthesized"%'
+       AND tags NOT LIKE '%"auto-pattern"%'
+       AND tags NOT LIKE '%"auto-insight"%'`;
+
+    const [rows, totalRow] = await Promise.all([
+      env.DB.prepare(
+        `SELECT id, content, source, created_at, recall_count
+         FROM entries WHERE ${scope.clause} AND ${exclusions}
+         ORDER BY recall_count DESC, created_at DESC LIMIT ?`,
+      ).bind(...scope.bindings, limit).all(),
+      env.DB.prepare(
+        `SELECT SUM(recall_count) AS total, SUM(contradiction_wins) AS contradictions
+         FROM entries WHERE ${scope.clause} AND ${exclusions}`,
+      ).bind(...scope.bindings).first() as Promise<Record<string, any> | null>,
+    ]);
+
+    return json({
+      ok: true,
+      total_recalls: Number(totalRow?.total ?? 0),
+      total_contradictions: Number(totalRow?.contradictions ?? 0),
+      entries: (rows.results as any[]).map(r => ({
+        id: r.id as string,
+        content: r.content as string,
+        source: r.source as string,
+        created_at: r.created_at as number,
+        recall_count: Number(r.recall_count ?? 0),
+      })),
+    });
+  }
+
+  // GET /stats/night, last night's maintenance summary, read from KV. Never
+  // derived from D1 at read time: edges has no index on workspace_id or
+  // created_at, so counting "links inferred since last night" here would be a
+  // full scan of the edge table on every dashboard open (the same cost class
+  // GET /stats/graph?deep=1 refuses to let run on a schedule). The nightly
+  // scheduled() handler writes the summary once per workspace per night
+  // instead (src/runtime/night-summary.ts); this only reads it back.
+  if (url.pathname === "/stats/night" && request.method === "GET") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    // readableWorkspaces, not a hand-built list: it appends "" for admins,
+    // the legacy pre-team bucket the maintenance rotation can still land on
+    // (src/runtime/rotation.ts), which every other scoped read already covers.
+    const workspaceIds = readableWorkspaces(auth);
+    const records = (await Promise.all(
+      workspaceIds.map(id => readNightSummary(env, id)),
+    )).filter((r): r is NightSummary => r !== null);
+
+    if (!records.length) return json({ ok: true, ranAt: null });
+
+    return json({
+      ok: true,
+      ranAt: Math.max(...records.map(r => r.ranAt)),
+      linksInferred: records.reduce((sum, r) => sum + r.linksInferred, 0),
+      insightsProposed: records.reduce((sum, r) => sum + r.insightsProposed, 0),
+      digestsWritten: records.reduce((sum, r) => sum + r.digestsWritten, 0),
+      claimsFlagged: records.reduce((sum, r) => sum + r.claimsFlagged, 0),
+    });
+  }
+
+  // GET /health, index/runtime health, used by the dashboard banner, the
   // README verify step, and external uptime checks. Authenticated like the
   // rest of the API but deliberately NOT admin-gated: it reports index state,
   // not cross-workspace data, and every signed-in member's dashboard banner
@@ -784,37 +948,41 @@ export async function handleAdminRoutes(
     // but until a second member is invited the toggle is noise for a solo
     // owner, so the flag reads actual membership, not provisioning.
     //
-    // isTeamBrain owns the whole decision — the TEAM_MODE setting and, when it
+    // isTeamBrain owns the whole decision, the TEAM_MODE setting and, when it
     // says "auto", the headcount. countActiveMembers, not a bare COUNT(*):
     // a removed member keeps their `users` row as a tombstone so their shared
     // memories stay attributable, and counting those made "team" a one-way door
-    // — add one colleague ever, and the brain could never read as solo again.
+    //, add one colleague ever, and the brain could never read as solo again.
     // Suspended people still count; see that function's comment for why.
     const team = await isTeamBrain(env);
     // Result-quality signal, not correctness: every hydration below this is
     // scoped at the SQL layer regardless, so a degraded filter never leaks
-    // another workspace's data — it just lets foreign candidates crowd out
+    // another workspace's data, it just lets foreign candidates crowd out
     // the caller's own in the vector index's own topK before SQL filters
     // them back out. `latchedAt` reads the durable KV marker rather than
     // trusting the in-memory latch alone, so the signal survives isolate
     // churn between deploys.
     const { supported, degradedQueries } = vectorizeFilterState();
     // A KV blip must not turn this route's other, independently-available
-    // signals (vectorize.ok, team) into a 500 — /health previously depended
+    // signals (vectorize.ok, team) into a 500, /health previously depended
     // on describe() and one D1 count only. `.catch(() => null)` degrades
     // latchedAt to "unknown" instead, exactly like a marker that was never
     // written.
     const latchedAtRaw = await env.OAUTH_KV.get(VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY).catch(() => null);
     const latchedAt = latchedAtRaw ? Number(latchedAtRaw) : null;
+    // T-0101.8.5: the KV marker set once history starts being recorded (T-0089.1.1),
+    // read here only — no D1 fallback. Omitted, not null, when it has never been set.
+    const historySinceRaw = await env.OAUTH_KV.get(VERSIONS_SINCE_KV_KEY).catch(() => null);
     return json({
       ok: vectorize.ok,
       version: SB_VERSION,
       vectorize: { ...vectorize, workspaceFilter: { supported, degradedQueries, latchedAt } },
       team,
+      ...(historySinceRaw ? { history_since: Number(historySinceRaw) } : {}),
     });
   }
 
-  // GET /patterns — the whole review queue, paged.
+  // GET /patterns, the whole review queue, paged.
   //
   // The dashboard used to build this list from `/list?n=20&tag=auto-pattern`
   // (the old producer) and drop the deprecated rows in the browser, which
@@ -830,7 +998,7 @@ export async function handleAdminRoutes(
   // things once it had more. A member's Home screen calls /patterns on every load
   // (public/js/brief.js) and got a 403, so the insight feature was invisible to
   // everyone but the admin; and the admin's queues were unscoped, so they printed
-  // colleagues' private memories in full — the same rows GET /entry answers 404
+  // colleagues' private memories in full, the same rows GET /entry answers 404
   // for with the same token. Scoping alone would have left members' flagged
   // memories reviewable by nobody at all.
   if (url.pathname === "/patterns" && request.method === "GET") {
@@ -869,13 +1037,13 @@ export async function handleAdminRoutes(
     const pageRows = rows.results as Record<string, any>[];
     const pageIds = pageRows.map(r => r.id as string);
     // One query for the whole page rather than one per insight. LEFT JOIN so a
-    // source deleted after the edge was written still surfaces as a row — the
+    // source deleted after the edge was written still surfaces as a row, the
     // edges table has no foreign keys, so an edge can outlive its target, and
     // the reviewer needs to be told the source is gone rather than shown a gap.
     const sourcesByInsight = new Map<string, ({ id: string; content: string } | { id: string; missing: true })[]>();
     if (pageIds.length) {
       // The scope goes in the JOIN's ON clause, not the WHERE. Only `e.source_id`
-      // was ever constrained here — those are the scoped page's insight ids — but
+      // was ever constrained here, those are the scoped page's insight ids, but
       // the CONTENT returned comes from `e.target_id`, which nothing constrained,
       // so an insight the caller may read handed back the full text of a memory
       // in a colleague's personal workspace. It is the same defect as the
@@ -886,7 +1054,7 @@ export async function handleAdminRoutes(
       // whole point is that a source deleted after the edge was written still
       // surfaces as a row. A WHERE predicate would drop those rows (NULL IN (...)
       // is never true) and take the "missing" signal with them. In the ON clause,
-      // an unreadable source reads exactly like a deleted one — the reviewer is
+      // an unreadable source reads exactly like a deleted one, the reviewer is
       // told the source is unavailable rather than shown a colleague's memory,
       // which is the same answer GET /entry gives for that id.
       //
@@ -895,7 +1063,7 @@ export async function handleAdminRoutes(
       // what lets scripts/check-scope.mjs attribute the clause to `m` instead of
       // counting it against whichever table reference it reaches first.
       const mScope = scopeWhere(auth);
-      // scope-outer-join: the edges alias e is pinned by source_id IN (the scoped insight page above), so every row here already belongs to the caller; the entries alias m is reached by a LEFT JOIN and its clause is in the ON, which nulls a column rather than dropping a row. That is sufficient HERE and only here, because m contributes exactly one column: `content`. The row itself, and the `id` beside it, come from `e.target_id` — an edge of the caller's own insight — so an unreadable source renders as { missing: true }, which is what a source DELETED after the edge was written renders as, and what GET /entry answers for that id. A WHERE predicate would drop those rows and take the "missing" signal with them
+      // scope-outer-join: the edges alias e is pinned by source_id IN (the scoped insight page above), so every row here already belongs to the caller; the entries alias m is reached by a LEFT JOIN and its clause is in the ON, which nulls a column rather than dropping a row. That is sufficient HERE and only here, because m contributes exactly one column: `content`. The row itself, and the `id` beside it, come from `e.target_id`, an edge of the caller's own insight, so an unreadable source renders as { missing: true }, which is what a source DELETED after the edge was written renders as, and what GET /entry answers for that id. A WHERE predicate would drop those rows and take the "missing" signal with them
       const sourceRows = (await env.DB.prepare(
         `SELECT e.source_id AS insight_id, e.target_id AS id, m.content AS content
          FROM edges e LEFT JOIN entries m ON m.id = e.target_id AND m.${mScope.clause}
@@ -916,7 +1084,7 @@ export async function handleAdminRoutes(
     // (src/lib/scope.ts). The client cannot infer this itself: it holds no
     // workspace ids, and the one thing it could read a layer off (`sources`)
     // describes the INPUTS, not the insight.
-    // Issues NO statement for an empty list — and in practice it always is
+    // Issues NO statement for an empty list, and in practice it always is
     // empty, because every row in this queue carries `auto-insight` and every
     // auto-insight row is written with actorId "". The call is made anyway
     // rather than skipped on that basis: "every row here is system-authored"
@@ -936,7 +1104,7 @@ export async function handleAdminRoutes(
         sources: sourcesByInsight.get(r.id as string) ?? [],
         workspace: layerOf(auth, r.workspace_id),
         // The same resolver /list, /entry and /graph call, given the same
-        // inputs — so an insight cannot be attributed one way in the review
+        // inputs, so an insight cannot be attributed one way in the review
         // queue and another way on the card the reader opens next.
         actor_name: resolveActorLabel(String(r.actor_id ?? ""), labelMap, {
           viewerId: auth.userId,
@@ -949,11 +1117,11 @@ export async function handleAdminRoutes(
     });
   }
 
-  // GET /stale — the out-of-date review queue.
+  // GET /stale, the out-of-date review queue.
   //
   // Home's chip reads "N may be out of date" off an exact tag predicate, so the
   // entries behind that number are knowable exactly. It used to be wired to a
-  // free-text recall for the phrase "What might be out of date?" — a vector
+  // free-text recall for the phrase "What might be out of date?", a vector
   // search over the whole brain, which returns the flagged entries only by
   // coincidence, and on a real brain returned two memories that merely contained
   // the words while the one actually flagged never appeared.
@@ -976,9 +1144,10 @@ export async function handleAdminRoutes(
     // and an admin gets a 404 from GET /entry for a member's personal row. The
     // reviewer confirms or corrects their own claims, not a colleague's.
     const scope = scopeWhere(auth);
+    const now = Date.now();
     const [rows, countRow] = await Promise.all([
       env.DB.prepare(
-        `SELECT id, content, tags, source, created_at, COALESCE(updated_at, created_at) AS last_updated
+        `SELECT id, content, tags, source, created_at, when_at, valid_until, COALESCE(updated_at, created_at) AS last_updated
          FROM entries
          WHERE ${STALE_REVIEW_SQL} AND ${scope.clause}
          ORDER BY COALESCE(updated_at, created_at) ASC LIMIT ? OFFSET ?`,
@@ -993,23 +1162,28 @@ export async function handleAdminRoutes(
       // Oldest-touched first: the least recently confirmed claim is the one most
       // worth a human's attention, and it keeps paging stable while entries drop
       // out of the queue as they are edited.
-      entries: (rows.results as Record<string, any>[]).map(r => ({
-        id: r.id as string,
-        content: r.content as string,
-        tags: JSON.parse((r.tags as string) ?? "[]") as string[],
-        source: r.source as string,
-        created_at: r.created_at as number,
-        last_updated: r.last_updated as number,
-      })),
+      entries: (rows.results as Record<string, any>[]).map(r => {
+        const tags = JSON.parse((r.tags as string) ?? "[]") as string[];
+        return {
+          id: r.id as string,
+          content: r.content as string,
+          tags,
+          source: r.source as string,
+          created_at: r.created_at as number,
+          last_updated: r.last_updated as number,
+          valid_until: r.valid_until as number | null,
+          reason: staleReasonFor(tags, r.when_at as number | null, now),
+        };
+      }),
       total: (countRow?.n as number) ?? 0,
       limit,
       offset,
     });
   }
 
-  // POST /stale/keep — confirm a flagged memory is still true without editing it.
-  // Dashboard-only, no MCP twin: like insight review, this is a human curation
-  // act on the out-of-date queue. Clears stale:as-of and bumps updated_at so the
+  // POST /stale/keep, confirm a flagged memory is still true without editing it.
+  // Agents may settle this on the user's word through MCP resolve. The audit
+  // event records the prior values. Clears stale:as-of and bumps updated_at so the
   // nightly pass does not immediately re-flag the same claim.
   if (url.pathname === "/stale/keep" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
@@ -1019,35 +1193,252 @@ export async function handleAdminRoutes(
     try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
 
-    const id = body.id.trim();
-    const row = await getReadableEntry(env, auth, id, "id, workspace_id, actor_id, tags");
-    if (!row) return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
-    const denied = assertCanEditContent(auth, row);
-    if (denied) return json({ ok: false, error: denied.message }, 403);
-
-    const tags: string[] = JSON.parse(row.tags ?? "[]");
-    if (!hasStaleAsOf(tags)) {
-      return json({ ok: false, error: "Entry is not flagged as out of date" }, 400);
-    }
-
-    const now = Date.now();
-    await env.DB.prepare(
-      `UPDATE entries SET tags = ?, updated_at = ?, staleness_checked_at = ? WHERE id = ?`,
-    ).bind(JSON.stringify(withoutStaleAsOf(tags)), now, now, id).run();
-
-    auditEvents(env, ctx, [{ entryId: id, actorId: auth.userId, event: "updated", payload: { stale_confirmed: true } }]);
-
-    return json({ ok: true, id });
+    const result = await resolveEntryAction(env, ctx, auth, body.id.trim(), "still_true", undefined, { actorId: auth.userId, channel: "rest" });
+    if (!result.ok) return json({ ok: false, error: result.error }, result.status);
+    return json({ ok: true, id: result.id });
   }
 
-  // POST /patterns/resolve — confirm or dismiss a proposed insight.
-  // Dashboard-only, no MCP twin: insight review is a human curation act, not
-  // an agent capability. Confirm promotes an insight into a real recallable
+  // GET /loops, the open-commitments review queue. Mirrors GET /stale: the
+  // predicate is shared with the count GET /brief puts on its chip
+  // (OPEN_LOOP_SQL) so the two cannot disagree, and this queue exists for the
+  // same reason that one does — a member re-reading a scrollback for "what did
+  // I say I'd do" cannot ask a vector index that question reliably.
+  if (url.pathname === "/loops" && request.method === "GET") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    const limit = intParam(url, "limit", { fallback: 50, min: 1, max: 100 });
+    if (limit instanceof Response) return limit;
+    const offset = intParam(url, "offset", { fallback: 0, min: 0 });
+    if (offset instanceof Response) return offset;
+    // P7.8: defaults to "out" so every existing client (none of which send
+    // direction) keeps today's meaning, "things I owe". The dashboard asks
+    // for both explicitly.
+    const direction = url.searchParams.get("direction") ?? "out";
+    if (direction !== "out" && direction !== "in" && direction !== "all") {
+      return json({ ok: false, error: 'direction must be "out", "in" or "all"' }, 400);
+    }
+    const now = Date.now();
+    const directionSql = direction === "out" ? openOutboundSql(now) : direction === "in" ? openInboundSql(now) : openLoopSql(now);
+
+    const scope = scopeWhere(auth);
+    // validity: current: a replaced loop is not open (5.5)
+    const [rows, countRow] = await Promise.all([
+      env.DB.prepare(
+        `SELECT id, content, tags, source, created_at FROM entries
+         WHERE ${directionSql} AND ${scope.clause}
+         ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      ).bind(...scope.bindings, limit, offset).all(),
+      // validity: current: the pager's total must match the same replaced-loop exclusion as the rows above (5.5)
+      env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM entries WHERE ${directionSql} AND ${scope.clause}`,
+      ).bind(...scope.bindings).first() as Promise<Record<string, any> | null>,
+    ]);
+
+    return json({
+      ok: true,
+      entries: (rows.results as Record<string, any>[]).map(r => {
+        const tags = parseTags(r.tags as string);
+        return {
+          id: r.id as string,
+          content: r.content as string,
+          source: r.source as string,
+          tags,
+          created_at: r.created_at as number,
+          direction: directionOf(tags),
+          ...(counterpartyOf(tags) ? { counterparty: counterpartyOf(tags) } : {}),
+        };
+      }),
+      total: (countRow?.n as number) ?? 0,
+      limit,
+      offset,
+    });
+  }
+
+  // POST /loops/resolve, close out one open commitment. "done" marks it
+  // finished without disturbing the "task" tag, which is history; "not-task"
+  // means the tag never belonged, so it comes off outright.
+  //
+  // CAS on tags AND content, three attempts — the same guard shape as the
+  // staleness pass's per-row write (src/staleness/pass.ts): tags alone would
+  // not catch a concurrent content-only rewrite landing between the read here
+  // and the write below, and re-reading the row for each attempt means a
+  // retry classifies from what is actually there rather than a snapshot that
+  // just lost a race.
+  if (url.pathname === "/loops/resolve" && request.method === "POST") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    let body: { id?: string; action?: string };
+    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
+    if (body.action !== "done" && body.action !== "not-task") {
+      return json({ ok: false, error: `action must be "done" or "not-task"` }, 400);
+    }
+
+    const result = await resolveEntryAction(env, ctx, auth, body.id.trim(), body.action === "done" ? "done" : "not_a_task", undefined, { actorId: auth.userId, channel: "rest" });
+    if (!result.ok) return json({ ok: false, error: result.error }, result.status);
+    return json({ ok: true, id: result.id, action: body.action });
+  }
+
+  // GET /due, the time-anchored feed: overdue commitments (when_at already
+  // passed) and upcoming ones (within the next 48 hours), each capped and
+  // counted. This is the only source scripts/brief-preview.mjs's --dry-run
+  // check and the future push sender both read from — a due date exists on
+  // an entry the moment when_at is set, by whichever of the three producers
+  // (explicit, src/when/heuristic.ts, src/when/pass.ts) set it.
+  if (url.pathname === "/due" && request.method === "GET") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    const scope = scopeWhere(auth);
+    const now = Date.now();
+    const upcomingBefore = now + DUE_WITHIN_MS;
+
+    const rowShape = (r: Record<string, any>) => {
+      const tags = parseTags(r.tags as string);
+      return {
+        id: r.id as string,
+        content: (r.content as string).slice(0, DUE_CONTENT_CHARS),
+        // The nightly pass's short label when it set the when (src/when/pass.ts),
+        // else the first 80 characters of content as a fallback for the
+        // explicit/regex paths, which never generate one.
+        label: (r.when_label as string | null) || (r.content as string).slice(0, 80),
+        tags,
+        when_at: r.when_at as number,
+        when_kind: r.when_kind as string,
+        when_source: r.when_source as string,
+        // Design 5.3: derived from tags in JS, no SQL change — rows already carry tags.
+        kind: dueKindOf(tags),
+      };
+    };
+
+    // validity: current: a replaced "dentist Tuesday" must not appear in GET /due (5.5)
+    const [overdueRows, overdueCount, upcomingRows, upcomingCount] = await Promise.all([
+      env.DB.prepare(
+        `SELECT id, content, tags, when_at, when_kind, when_source, when_label FROM entries
+         WHERE ${dueSql(now)} AND when_at < ? AND ${scope.clause}
+         ORDER BY when_at ASC LIMIT ?`,
+      ).bind(now, ...scope.bindings, DUE_FEED_LIMIT).all(),
+      // validity: current: the overdue pager's total must match the same replaced-fact exclusion as the rows above (5.5)
+      env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM entries WHERE ${dueSql(now)} AND when_at < ? AND ${scope.clause}`,
+      ).bind(now, ...scope.bindings).first() as Promise<Record<string, any> | null>,
+      // validity: current: a replaced "dentist Tuesday" must not appear in the upcoming feed either (5.5)
+      env.DB.prepare(
+        `SELECT id, content, tags, when_at, when_kind, when_source, when_label FROM entries
+         WHERE ${dueSql(now)} AND when_at >= ? AND when_at <= ? AND ${scope.clause}
+         ORDER BY when_at ASC LIMIT ?`,
+      ).bind(now, upcomingBefore, ...scope.bindings, DUE_FEED_LIMIT).all(),
+      // validity: current: the upcoming pager's total must match the same replaced-fact exclusion as the rows above (5.5)
+      env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM entries WHERE ${dueSql(now)} AND when_at >= ? AND when_at <= ? AND ${scope.clause}`,
+      ).bind(now, upcomingBefore, ...scope.bindings).first() as Promise<Record<string, any> | null>,
+    ]);
+
+    return json({
+      ok: true,
+      overdue: (overdueRows.results as Record<string, any>[]).map(rowShape),
+      upcoming: (upcomingRows.results as Record<string, any>[]).map(rowShape),
+      counts: {
+        overdue: (overdueCount?.n as number) ?? 0,
+        upcoming: (upcomingCount?.n as number) ?? 0,
+      },
+    });
+  }
+
+  // POST /due/snooze, push a time anchor out to a new date without touching
+  // when_kind or when_label. Validated the same way an explicit when is
+  // (future, no more than 5 years out) plus a floor parseExplicitWhen does
+  // not itself enforce: a snooze into the past is not a snooze.
+  //
+  // CAS on tags AND content, three attempts — same guard shape as
+  // /loops/resolve above, so a concurrent edit or delete between the read and
+  // the write below is caught rather than clobbered.
+  if (url.pathname === "/due/snooze" && request.method === "POST") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    let body: { id?: string; until?: string };
+    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
+    if (!body.until?.trim()) return json({ ok: false, error: "until is required" }, 400);
+
+    const result = await resolveEntryAction(env, ctx, auth, body.id.trim(), "snooze", body.until, { actorId: auth.userId, channel: "rest" });
+    if (!result.ok) return json({ ok: false, error: result.error }, result.status);
+    return json({ ok: true, id: result.id, when_at: result.when_at });
+  }
+
+  // POST /due/clear, drop the time anchor entirely: not a commitment, or
+  // already handled outside the loop-resolve flow. when_source becomes
+  // 'cleared' rather than NULL so the nightly pass's prefilter (when_at IS
+  // NULL AND when_source IS NULL, src/when/pass.ts) never re-stamps it — a
+  // cleared entry stays cleared until a caller sets a when explicitly again.
+  //
+  // CAS on tags AND content, same shape as /loops/resolve and /due/snooze above.
+  if (url.pathname === "/due/clear" && request.method === "POST") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+
+    let body: { id?: string };
+    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
+
+    const result = await resolveEntryAction(env, ctx, auth, body.id.trim(), "clear_date", undefined, { actorId: auth.userId, channel: "rest" });
+    if (!result.ok) return json({ ok: false, error: result.error }, result.status);
+    return json({ ok: true, id: result.id });
+  }
+
+  // GET /extract/dry-run, a preview of the nightly when-extraction pass
+  // (src/when/pass.ts) against the live brain: the exact prefilter and the
+  // exact model call, on the next N candidates past the pass's own cursor,
+  // reporting every verdict without persisting anything or moving the
+  // cursor. Mirrors GET /insights/dry-run's shape and purpose — testing
+  // extraction quality on real data is the whole reason this exists.
+  if (url.pathname === "/extract/dry-run" && request.method === "GET") {
+    const auth = await requireAdmin(request, env);
+    if (auth instanceof Response) return auth;
+
+    const limit = intParam(url, "limit", { fallback: 5, min: 1, max: 10 });
+    if (limit instanceof Response) return limit;
+
+    const cursor = await readWhenCursor(env);
+    const scope = scopeWhere(auth);
+    const candidates = await fetchWhenCandidates(env, cursor, scope, limit);
+
+    const cfg = await resolveConfig(env);
+    const verdicts = [];
+    for (const candidate of candidates) {
+      const outcome = await judgeCommitment(candidate.content, Date.now(), env, cfg);
+      verdicts.push({
+        id: candidate.id,
+        content: candidate.content.slice(0, DUE_CONTENT_CHARS),
+        outcome: outcome.outcome,
+        what: outcome.outcome === "commitment" ? outcome.what : null,
+        due_at: outcome.outcome === "commitment" ? outcome.dueAt : null,
+        kind: outcome.outcome === "commitment" ? outcome.kind : null,
+        confidence: outcome.outcome === "commitment" ? outcome.confidence : null,
+      });
+      // A failed call means the batch stops here in production (the pass
+      // does not risk skipping it); the preview keeps going so a reviewer
+      // sees every candidate in the window, not just the ones before the
+      // first hiccup.
+    }
+
+    return json({ ok: true, candidates: verdicts });
+  }
+
+  // POST /patterns/resolve, confirm or dismiss a proposed insight.
+  // Agents may settle one insight on the user's word through MCP resolve;
+  // the audit event records each prior value. Confirm promotes it into a real recallable
   // memory; dismiss deprecates it (audit row kept, vectors removed).
   //
   // Takes `id` for one or `ids` for many. Ruling on a backlog one at a time is
   // the actual complaint this answers, and doing it as N single requests would
-  // be N round trips against a Worker that gets ~50 D1 queries per invocation.
+  // be N round trips — cheap against the platform's real 1,000-call ceiling,
+  // but this codebase holds each request to a self-imposed D1 budget of
+  // ~50 calls, and N round trips is N times the request/response overhead and
+  // CPU regardless.
   if (url.pathname === "/patterns/resolve" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
@@ -1062,7 +1453,7 @@ export async function handleAdminRoutes(
 
     // Scoped like the /patterns queue these ids come from. Confirm promotes a
     // memory and dismiss deprecates it and drops its vectors, so an unscoped
-    // lookup let an admin rewrite rows in a member's personal workspace — rows
+    // lookup let an admin rewrite rows in a member's personal workspace, rows
     // the same token cannot read through GET /entry.
     const scope = scopeWhere(auth);
     const bulkLimit = D1_MAX_BOUND_PARAMS - scope.bindings.length;
@@ -1091,96 +1482,26 @@ export async function handleAdminRoutes(
 
     const placeholders = ids.map(() => "?").join(", ");
     const { results } = await env.DB.prepare(
-      `SELECT id, tags, vector_ids FROM entries WHERE id IN (${placeholders}) AND ${scope.clause}`,
+      `SELECT id, tags, vector_ids, workspace_id FROM entries WHERE id IN (${placeholders}) AND ${scopeWhereForIdRead(scope).clause}`,
     ).bind(...ids, ...scope.bindings).all();
     const found = results as Record<string, any>[];
 
     // The single-id form keeps its precise errors, because a client asking about
     // one pattern can act on "not found" and the bulk form cannot.
     if (body.ids === undefined) {
-      if (!found.length) return json({ ok: false, error: `No entry found with ID: ${ids[0]}` }, 404);
+      if (!found.length) return json({ ok: false, error: `No memory found with ID: ${ids[0]}` }, 404);
       if (!(JSON.parse(found[0].tags ?? "[]") as string[]).includes("auto-insight")) {
         return json({ ok: false, error: "Entry is not a derived insight" }, 400);
       }
     }
 
-    const statements: D1PreparedStatement[] = [];
-    const vectorsToDrop: string[] = [];
-    const resolved: string[] = [];
-    // The record of who ruled on what. There is deliberately NO author lock on
-    // this route — an insight has actor_id "" and no author, so it is a shared
-    // suggestion and any member acting on one is the feature working. That is
-    // precisely why the record matters: without it, a member dismissing a
-    // company-layer insight for everyone leaves no trace, and GET /team/activity
-    // is blind to the one action on this surface that is invisible by design.
-    //
-    // Two names rather than one plus a payload flag, for the reason
-    // member_suspended and member_unsuspended are two names.
-    const auditRows: AuditEventInput[] = [];
-
-    for (const row of found) {
-      const tags: string[] = JSON.parse(row.tags ?? "[]");
-      // Anything that is not an unresolved pattern is skipped rather than
-      // rejected: a bulk request built from a list the user was looking at can
-      // legitimately race a nightly pass or a second tab.
-      if (!tags.includes("auto-insight") || getStatus(tags) === "deprecated") continue;
-
-      if (action === "confirm") {
-        // Losing the auto-insight tag is what exits the recall exclusion — it is
-        // enforced at D1 hydration, not vector metadata, so this tag update alone
-        // makes the entry recallable. No re-embed: content is unchanged and vectors
-        // already exist (the stale auto-insight flag in vector metadata is harmless).
-        const promoted = withStatus(withKind(tags.filter(t => t !== "auto-insight"), "semantic"), "canonical");
-        statements.push(
-          env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(promoted), row.id),
-        );
-      } else {
-        // Inlined rather than calling deprecateEntry per id: that reads the row
-        // again and issues its own UPDATE and its own Vectorize delete, so a
-        // hundred dismissals would be three hundred subrequests. Same effect —
-        // status:deprecated, vectors emptied, vectors deleted — in a fixed three.
-        statements.push(
-          env.DB.prepare(`UPDATE entries SET tags = ?, vector_ids = ? WHERE id = ?`)
-            .bind(JSON.stringify(withStatus(tags, "deprecated")), "[]", row.id),
-        );
-        vectorsToDrop.push(...(JSON.parse(row.vector_ids ?? "[]") as string[]));
-      }
-      resolved.push(row.id as string);
-      auditRows.push({
-        entryId: row.id as string,
-        actorId: auth.userId,
-        event: action === "confirm" ? "insight_confirmed" : "insight_dismissed",
-      });
-    }
-
-    // One subrequest however many statements it holds, which is the whole reason
-    // the loop above builds them instead of running them.
-    if (statements.length) await env.DB.batch(statements);
-    // After the state change and off the critical path: one batch however many
-    // ids the request carried, so the route's cost stays flat in the id count,
-    // and fire-and-forget so a lost row can never cost a resolution. Only rows
-    // actually ruled on are recorded — a skipped or out-of-scope id was not
-    // resolved, and a false entry in an INSERT-only trail cannot be corrected.
-    auditEvents(env, ctx, auditRows);
-
-    if (vectorsToDrop.length) {
-      try {
-        await env.VECTORIZE.deleteByIds(vectorsToDrop);
-      } catch (e) {
-        // D1 already says deprecated and recall filters on that, so the entries
-        // are out of recall either way; the index just keeps some dead vectors.
-        console.error("Vectorize deleteByIds failed during bulk dismiss (non-fatal):", e);
-      }
-    }
-
+    const result = await applyInsightResolution(env, ctx, { actorId: auth.userId, channel: "rest" }, found, ids.length, action);
     return json({
       ok: true,
       action,
-      resolved: resolved.length,
-      // Named, so a client that showed the user N rows can tell which survived a
-      // race rather than assuming all of them were ruled on.
-      ids: resolved,
-      skipped: ids.length - resolved.length,
+      resolved: result.resolved.length,
+      ids: result.resolved,
+      skipped: result.skipped,
       ...(body.ids === undefined ? { id: ids[0] } : {}),
     });
   }
@@ -1194,61 +1515,56 @@ export async function handleAdminRoutes(
 
     // Deprecated entries are skipped, matching the migration path
     // (src/migration/embedding.ts). Without this, dismissing a pattern deleted
-    // its vectors and then this button put them straight back — spending the
+    // its vectors and then this button put them straight back, spending the
     // daily embedding budget to reindex something the user had just told the
     // brain to drop, and crowding the vector query with candidates that recall
     // discards at hydration anyway.
     const { results: toProcess } = await env.DB.prepare(
       // scope-exempt: admin repair backlog: deployment-wide by design, returns counts not content
+      // validity: any: a replaced row keeps its vectors and must stay re-indexable here (5.5)
       `SELECT id, content, tags, source, created_at, workspace_id, actor_id FROM entries
-       WHERE vector_ids = '[]' AND created_at < ? AND ${INDEXABLE_SQL}
+       WHERE ${PENDING_WHERE}
        ORDER BY created_at DESC LIMIT 25`
-    ).bind(graceCutoff).all();
+    ).bind(graceCutoff).all<PendingRow>();
 
     let processed = 0;
     let failed = 0;
 
-    for (const row of toProcess as Record<string, any>[]) {
+    for (const row of toProcess) {
       try {
-        await storeEntry(
-          env,
-          row.id as string,
-          row.content as string,
-          JSON.parse(row.tags as string),
-          row.source as string,
-          row.created_at as number,
-          // Without this the backfill embeds with DEFAULTS.EMBEDDING_MODEL while
-          // capture and recall use the configured one, writing vectors from the
-          // wrong model into the index — scores go quietly wrong, nothing throws.
-          cfg,
-          // This route repairs OTHER members' rows by design — the context comes
-          // from the row, never from `auth`. Stamping the admin's workspace here
-          // would move every repaired vector into the admin's own space.
-          { workspaceId: row.workspace_id as string, actorId: row.actor_id as string },
-        );
-        processed++;
+        // cfg carries the configured embedding model; indexPendingRow stamps the ROW's own
+        // workspace and author, never the admin's.
+        // False: the row changed content or workspace mid-embed; it stays pending for the next call.
+        if (await indexPendingRow(env, row, cfg)) processed++; else failed++;
       } catch (e) {
         console.error("Re-embed failed for entry", row.id, e);
         failed++;
       }
     }
 
-    // Same filter as the select above, or the loop never reaches zero: the
-    // dashboard presses this until `remaining` is 0, so counting rows the select
-    // refuses to process would spin until the batch-made-no-progress guard.
+    // Every still-unindexed row, not just the past-grace ones the select above can touch (adv-final
+    // MAJOR 2): a row inside its grace window is genuinely pending, not done, so reporting
+    // `remaining: 0` while it sits there would tell a caller — including the undo reply this
+    // backs — that indexing finished when it has not even started. oldest, of that same set,
+    // drives retryAfterMs: 0 once nothing is left, otherwise how long until the longest-waiting
+    // row leaves its grace window and this endpoint can actually make progress on it.
     const remaining = await env.DB.prepare(
-      // scope-exempt: admin repair backlog: must match the SELECT above or the loop never reaches zero
-      `SELECT COUNT(*) as count FROM entries WHERE vector_ids = '[]' AND created_at < ? AND ${INDEXABLE_SQL}`
-    ).bind(graceCutoff).first() as Record<string, any> | null;
+      // scope-exempt: admin repair backlog: deployment-wide by design, returns counts not content
+      // validity: any: must match the toProcess selection above, replaced rows included (5.5)
+      `SELECT COUNT(*) as count, MIN(created_at) as oldest FROM entries WHERE vector_ids = '[]' AND ${INDEXABLE_SQL}`
+    ).first() as Record<string, any> | null;
+    const remainingCount = (remaining?.count as number) ?? 0;
+    const oldestCreatedAt = remaining?.oldest as number | null;
+    const retryAfterMs = remainingCount === 0 ? 0 : Math.max(0, (oldestCreatedAt as number) + graceMs(env) - Date.now());
 
-    return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
+    return json({ processed, failed, remaining: remainingCount, retryAfterMs });
   }
 
   // POST /classify-pending
   // One-time, opt-in backfill: runs classifyEntry over entries that predate the
   // status (#119) and kind (#12) features and writes status:/kind: tags. Bounded
   // batch per call, idempotent (skips entries that already carry either tag), and
-  // resumable (safe to stop/restart). No schema migration — only writes tags.
+  // resumable (safe to stop/restart). No schema migration, only writes tags.
   if (url.pathname === "/classify-pending" && request.method === "POST") {
     const auth = await requireAdmin(request, env);
     if (auth instanceof Response) return auth;
@@ -1264,17 +1580,21 @@ export async function handleAdminRoutes(
 
     let processed = 0;
     let failed = 0;
+    let skipped = 0;
 
     for (const row of toProcess as Record<string, any>[]) {
       try {
         // cfg carries the user's LLM_MODEL choice; without it this backfill
         // classifies with the shipped default and ignores their setting.
         const { canonical, kind } = await classifyEntry(row.content as string, env, cfg);
-        let tags: string[] = JSON.parse(row.tags as string);
+        const readTags: string = row.tags as string;
+        let tags: string[] = JSON.parse(readTags);
         if (kind) tags = withKind(tags, kind);
-        if (canonical && getStatus(tags) === null) tags = withStatus(tags, "canonical");
-        await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(tags), row.id).run();
-        processed++;
+        if (canonical && getStatus(tags) === null && !hasCapsuleTag(tags)) tags = withStatus(tags, "canonical");
+        // versioning: exempt: hygiene, compare-and-set on the tags read (T-0089.10); a miss is skipped, not overwritten
+        const res = await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ? AND tags = ?`).bind(JSON.stringify(tags), row.id, readTags).run();
+        if ((res.meta.changes ?? res.meta.rows_written ?? 0) === 0) skipped++;
+        else processed++;
       } catch (e) {
         console.error("Classification backfill failed for entry", row.id, e);
         failed++;
@@ -1286,26 +1606,26 @@ export async function handleAdminRoutes(
       `SELECT COUNT(*) as count FROM entries WHERE ${UNCLASSIFIED_WHERE}`
     ).first() as Record<string, any> | null;
 
-    return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
+    return json({ processed, failed, skipped, remaining: (remaining?.count as number) ?? 0 });
   }
 
-  // POST /insights/accrue — run one accrual pass on demand, right now.
+  // POST /insights/accrue, run one accrual pass on demand, right now.
   //
   // The nightly cron (runInsightAccrual, src/insight/candidates.ts) examines
   // only ACCRUAL_SEED_LIMIT (25) entries per run, topped up from a backfill
   // cursor on quiet nights. That is fine for a brain that grows a little
   // every day, but a self-hoster installing this against an EXISTING brain
   // of a few thousand entries would otherwise wait months for the backfill
-  // cursor to cross it once — the weekly pass would have almost nothing to
+  // cursor to cross it once, the weekly pass would have almost nothing to
   // reason over, and the feature would look broken with no way to prime it.
   //
   // This calls the exact same function the cron does, once, synchronously,
-  // and reports what it found — no separate accrual logic lives here. The
+  // and reports what it found, no separate accrual logic lives here. The
   // cursor it walks is the SAME cursor the nightly cron uses (KV key
   // ACCRUAL_CURSOR_KEY), so calling this repeatedly walks it forward exactly
   // like repeated nights would: that is the intended way to prime a large
   // brain, not a one-shot backfill. Call it until `seeds_examined` comes back
-  // small — that means the cursor has caught up to the present.
+  // small, that means the cursor has caught up to the present.
   if (url.pathname === "/insights/accrue" && request.method === "POST") {
     const auth = await requireAdmin(request, env);
     if (auth instanceof Response) return auth;
@@ -1317,7 +1637,7 @@ export async function handleAdminRoutes(
     // Before/after rather than threading a write-count out of
     // runInsightAccrual itself: every row it inserts starts 'pending' and
     // nothing else in this request can change that count concurrently, so
-    // the delta is exactly how many candidates this pass newly recorded —
+    // the delta is exactly how many candidates this pass newly recorded,
     // including the ON CONFLICT(a_id, b_id) DO NOTHING case, where an
     // attempted insert did not actually add a row.
     const before = await pendingCount();
@@ -1335,11 +1655,11 @@ export async function handleAdminRoutes(
     });
   }
 
-  // GET /insights/dry-run — what the weekly pass would say, without saying it.
+  // GET /insights/dry-run, what the weekly pass would say, without saying it.
   //
   // Ships ahead of the weekly writer being enabled. The design was validated
   // against a brain that is not representative, so the first question is
-  // whether the shortlist is any good on real data — and this answers it for
+  // whether the shortlist is any good on real data, and this answers it for
   // the price of a few model calls and no writes at all. A declined candidate
   // is reported with null shape/text rather than dropped, so a reader can see
   // a high-scoring pair was considered and rejected, not just what survived.
@@ -1351,7 +1671,7 @@ export async function handleAdminRoutes(
     if (limit instanceof Response) return limit;
 
     // a.tags/b.tags added so this can apply the same D1 pair rule the weekly
-    // pass applies (src/insight/weekly.ts) — without them, this endpoint
+    // pass applies (src/insight/weekly.ts), without them, this endpoint
     // could not tell an assistant-authored pair from any other and would
     // report exactly what production refuses as if it would be written.
     //
@@ -1363,6 +1683,10 @@ export async function handleAdminRoutes(
     // which is how it stayed unscoped while every sibling query was fixed.
     const aScope = scopeWhere(auth, undefined, "a.workspace_id");
     const bScope = scopeWhere(auth, undefined, "b.workspace_id");
+    const dryRunNow = Date.now();
+    // validity: current: a replaced side of a candidate pair is not insight material (5.5)
+    // Codex review class E (T-0089.4.2): same gap and same fix as src/insight/weekly.ts's own
+    // draw query — a candidate accrued clean can be held by the time this preview reads it.
     const { results } = await env.DB.prepare(
       `SELECT c.id, c.a_id, c.b_id, c.score, a.content AS a_content, b.content AS b_content,
               a.tags AS a_tags, b.tags AS b_tags
@@ -1372,6 +1696,10 @@ export async function handleAdminRoutes(
        WHERE c.status = 'pending'
          AND a.tags NOT LIKE '%"status:deprecated"%'
          AND b.tags NOT LIKE '%"status:deprecated"%'
+         AND (a.valid_until IS NULL OR a.valid_until > ${dryRunNow})
+         AND (b.valid_until IS NULL OR b.valid_until > ${dryRunNow})
+         AND ${notHeldSqlFor("a")}
+         AND ${notHeldSqlFor("b")}
          AND ${aScope.clause} AND ${bScope.clause}
        ORDER BY c.score DESC
        LIMIT ?`,
@@ -1380,14 +1708,14 @@ export async function handleAdminRoutes(
     // D2's comparison list, built exactly as src/insight/weekly.ts builds it:
     // insights still unreviewed from earlier runs, seeded before the loop and
     // grown as this preview accepts candidates. Without this, the dry run
-    // could not reproduce the spec's own motivating case — a candidate
+    // could not reproduce the spec's own motivating case, a candidate
     // restating an insight a PRIOR run already wrote is invisible to a
     // same-run-only check.
     //
     // Scoped for the same reason the candidate query is, and the leak here is
     // quieter: the comparison text is never printed, but an unscoped list lets a
     // colleague's private proposal suppress the caller's own candidate with the
-    // reason "restates a recently written insight" — an admin told her preview
+    // reason "restates a recently written insight", an admin told her preview
     // duplicates something she cannot see and did not write.
     const scope = scopeWhere(auth);
     const { results: recentInsightRows } = await env.DB.prepare(
@@ -1399,25 +1727,25 @@ export async function handleAdminRoutes(
     const candidates = [];
     // Reasons over every row the query returned, deliberately past the three
     // production would ever write (src/insight/weekly.ts's own
-    // MAX_INSIGHTS_PER_RUN cap) — seeing candidates four and beyond is how the
+    // MAX_INSIGHTS_PER_RUN cap), seeing candidates four and beyond is how the
     // ranking itself gets judged. `would_write` marks the first three
     // candidates, in score order, that clear D1 (pair-eligible), the model
     // (an "insight" outcome), AND D2 (not restatesRecent against
-    // writtenThisRun) — the same three gates runWeeklyInsights applies before
+    // writtenThisRun), the same three gates runWeeklyInsights applies before
     // it ever calls captureEntry. This is close to but not exactly what
     // production's `written` counter tracks: that increments only when
     // captureEntry returns `status: "stored"`, so an accepted, non-restating
     // insight that turns out to duplicate an earlier ENTRY (not a recent
-    // insight — captureEntry's own separate duplicate check) consumes no slot
+    // insight, captureEntry's own separate duplicate check) consumes no slot
     // there but is still counted here. A dry run cannot resolve that without
     // calling captureEntry, which would make it a write rather than a preview
-    // — this is the one place that gap between preview and production is
+    //, this is the one place that gap between preview and production is
     // recorded.
     let written = 0;
     for (const row of results) {
       // D1 at the draw (src/insight/weekly.ts): a pair this disqualified is
       // never sent to the model in production, so the preview must not spend
-      // a model call on it either — otherwise the dry run reports as
+      // a model call on it either, otherwise the dry run reports as
       // writable exactly what production refuses, which is the bug the
       // Rollout section's comparison exists to catch.
       const aTags = parseTags(row.a_tags as string);
@@ -1437,7 +1765,7 @@ export async function handleAdminRoutes(
       }
 
       // cfg carries the user's LLM_MODEL choice, same as the real weekly pass
-      // (src/insight/weekly.ts) — without it this would preview reasoning from
+      // (src/insight/weekly.ts), without it this would preview reasoning from
       // the shipped default model rather than the one that will actually run.
       const result = await reasonOverPair(
         { content: row.a_content as string },

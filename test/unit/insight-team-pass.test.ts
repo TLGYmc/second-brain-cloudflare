@@ -165,6 +165,7 @@ describe("runWeeklyInsights — the workspace slice", () => {
     // here gets a brand-new :memory: database.
     resetDatabaseInit();
     sqlite = makeSqliteD1();
+    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
   });
 
   afterEach(() => sqlite.close());
@@ -399,6 +400,7 @@ describe("runWeeklyInsights — the workspace slice", () => {
     const runB = async (withOtherCompany: boolean) => {
       resetDatabaseInit();
       const db = makeSqliteD1();
+      db.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
       const seedWritten = (id: string, ws: string, text: string) => {
         db.seed({
           id, createdAt: NOW - DAY, tags: ["auto-insight"],
@@ -554,8 +556,9 @@ describe("runWeeklyInsights — the workspace slice", () => {
   });
 
   it("spends one statement per chunk of the slice and no more", async () => {
-    // The chunk size is the cost line: each chunk is a subrequest against the
-    // same 50-subrequest invocation the pass's model calls come out of, so
+    // The chunk size is the cost line: each chunk is a D1 call against the
+    // same self-imposed ~50-call invocation budget the pass's model calls
+    // come out of (the platform's real ceiling is 1,000), so
     // "chunk smaller to be safe" is not free. 49 ids (2 x 49 + 1 = 99
     // parameters) must still be ONE statement; 50 is where a second is owed.
     const draws = async (n: number) => {
@@ -645,11 +648,13 @@ describe("runWeeklyInsights — the workspace slice", () => {
   });
 
   it("stops adding statements before the slice can spend the whole invocation, and says so", async () => {
-    // Chunking trades a bound-parameter ceiling for a subrequest one: each
-    // extra statement is one more of the 50 this invocation gets, and the team
-    // invocation already measures 47 of 50 at its worst slate
+    // Chunking trades a bound-parameter ceiling for a D1-call one: each
+    // extra statement is one more of the self-imposed ~50 calls this
+    // invocation is held to (the platform's real ceiling is 1,000), and the
+    // team invocation already measures 47 of 50 at its worst slate
     // (test/integration/insight-cron-budget.test.ts). Left unbounded, a brain
-    // with enough company workspaces would overflow the budget mid-loop —
+    // with enough company workspaces would overflow the self-imposed budget
+    // mid-loop —
     // which loses the whole run, batch included, and is swallowed by the same
     // catch. Truncating is a real loss, so it is reported rather than assumed
     // to be noticed.
@@ -693,7 +698,7 @@ describe("runWeeklyInsights — the workspace slice", () => {
 describe("companyWorkspaceIds()", () => {
   let sqlite: SqliteD1;
 
-  beforeEach(() => { resetDatabaseInit(); sqlite = makeSqliteD1(); });
+  beforeEach(() => { resetDatabaseInit(); sqlite = makeSqliteD1(); sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run(); });
   afterEach(() => sqlite.close());
 
   const seedWorkspace = (id: string, kind: string) =>

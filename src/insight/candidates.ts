@@ -2,8 +2,11 @@
  * Nightly candidate accrual.
  *
  * Search and reasoning are split because coverage, not token cost, is what
- * binds. A weekly job gets ~50 D1 subrequests, which buys about 25 Vectorize
- * seeds — 97 weeks to cross a 1,940-entry brain once. Accruing nightly from the
+ * binds. This codebase holds a weekly job to a self-imposed D1 budget of ~50
+ * calls per invocation (well under the platform's real 1,000-call ceiling,
+ * but kept tight for cost and 10 ms-CPU reasons), which buys about 25
+ * Vectorize seeds — 97 weeks to cross a 1,940-entry brain once. Accruing
+ * nightly from the
  * entries just written turns that into continuous coverage, and new entries are
  * where new tension appears: a memory written today is the one most likely to
  * contradict or extend something from March.
@@ -24,6 +27,7 @@ import type { Env } from "../env";
 import { initializeDatabase } from "../db/init";
 import { VECTORIZE_GET_BY_IDS_BATCH, D1_MAX_BOUND_PARAMS } from "../constants";
 import { isInsightEligible, isAssistantAuthored } from "./eligibility";
+import { NOT_HELD_SQL, notHeldSqlFor } from "../quarantine/tags";
 import { MIN_GAP_MS, MIN_SIMILARITY, normalisePair, scoreCandidate, type ScorableEntry } from "./score";
 
 /**
@@ -43,8 +47,10 @@ export function isEligiblePair(a: { tags: string[] }, b: { tags: string[] }): bo
 export const ACCRUAL_CURSOR_KEY = "insight:accrual-cursor";
 
 /**
- * Seeds per run. Each costs one Vectorize query, and the budget is 50
- * subrequests for the whole invocation. Measured at a full 25-seed batch
+ * Seeds per run. Each costs one Vectorize query, and the self-imposed budget
+ * is 50 D1/Vectorize calls for the whole invocation (the platform's real
+ * ceiling is 1,000; this codebase keeps it far tighter for cost and CPU
+ * reasons). Measured at a full 25-seed batch
  * (steady-state, already-migrated schema): 1 schema probe + 1 seed select +
  * 2 getByIds batches + 25 queries + 1 D1 hydration lookup + 1 batched insert
  * + 1 supersedes select + 1 supersedes batched insert + 1 KV read + 1 KV
@@ -65,6 +71,7 @@ interface SeedRow {
   importance_score: number | null;
   vector_ids: string;
   workspace_id: string;
+  valid_until: number | null;
 }
 
 /** A neighbour, hydrated live from D1 rather than trusted from vector metadata. */
@@ -76,7 +83,11 @@ interface NeighbourRow {
   created_at: number;
   importance_score: number | null;
   workspace_id: string;
+  valid_until: number | null;
 }
+
+/** T-0089.2.1: a replaced row is not insight material (5.5). */
+const isCurrent = (validUntil: number | null, now: number): boolean => validUntil === null || validUntil > now;
 
 /** The examined-so-far position. A keyset, not an offset — see `seedSql`. */
 interface AccrualCursor {
@@ -134,13 +145,18 @@ async function writeCursor(env: Env, row: { created_at: number; id: string }): P
  * `src/migration/embedding.ts`'s `pageSql`, including the tie-break column.
  */
 function seedSql(hasCursor: boolean): string {
-  const where = hasCursor ? `WHERE created_at > ? OR (created_at = ? AND id > ?)` : "";
+  // Held rows are skipped in SQL, not only by isInsightEligible, so a burst of
+  // them cannot fill the ACCRUAL_SEED_LIMIT window (trust spec 5.3).
+  const where = hasCursor
+    ? `WHERE (created_at > ? OR (created_at = ? AND id > ?)) AND ${NOT_HELD_SQL}`
+    : `WHERE ${NOT_HELD_SQL}`;
   // workspace_id rides along so a candidate pair can be kept inside one workspace:
   // accrual walks every workspace's rows (it is a maintenance pass), but a pair
   // spanning two workspaces would have the weekly pass reason over two people's
   // memories at once, so the cross-workspace match is dropped at pairing time below.
+  // validity: current: a replaced memory is not insight seed material (5.5)
   // scope-exempt: cron: the accrual seed window is corpus-wide by design; workspace_id rides along so the pairing step below can drop cross-workspace pairs
-  return `SELECT id, content, tags, source, created_at, importance_score, vector_ids, workspace_id
+  return `SELECT id, content, tags, source, created_at, importance_score, vector_ids, workspace_id, valid_until
             FROM entries
             ${where}
            ORDER BY created_at ASC, id ASC
@@ -162,6 +178,7 @@ export interface AccrualSummary {
 
 export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promise<AccrualSummary> {
   let seedsExamined = 0;
+  const now = Date.now();
   try {
     await initializeDatabase(env);
 
@@ -185,6 +202,7 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
     const seeds = results.filter(r =>
       isInsightEligible({ content: r.content, tags: parseTags(r.tags), source: r.source })
       && parseTags(r.vector_ids).length > 0
+      && isCurrent(r.valid_until, now)
     );
 
     if (!seeds.length) {
@@ -266,9 +284,10 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
     for (let i = 0; i < neighbourIdList.length; i += D1_MAX_BOUND_PARAMS) {
       const batch = neighbourIdList.slice(i, i + D1_MAX_BOUND_PARAMS);
       const placeholders = batch.map(() => "?").join(", ");
+      // validity: current: a replaced neighbour is not insight material (5.5)
       const { results: hydrated } = await env.DB.prepare(
         // scope-exempt: by-id: neighbour hydration for ids from the accrual seed window
-        `SELECT id, content, tags, source, created_at, importance_score, workspace_id
+        `SELECT id, content, tags, source, created_at, importance_score, workspace_id, valid_until
            FROM entries
           WHERE id IN (${placeholders})`,
       ).bind(...batch).all() as { results: NeighbourRow[] };
@@ -292,6 +311,8 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
 
       const gap = Math.abs(seed.created_at - neighbour.created_at);
       if (gap < MIN_GAP_MS) continue;
+
+      if (!isCurrent(neighbour.valid_until, now)) continue;
 
       const neighbourTags = parseTags(neighbour.tags);
       const eligible = isInsightEligible({
@@ -350,6 +371,7 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
     // system-provenance edges are genuine, so these are proposals for the
     // reasoning step to accept or decline, never claims.
     try {
+      // validity: current: a replaced side of a supersedes pair is not insight material (5.5)
       const { results: superseded } = await env.DB.prepare(
         // scope-exempt: cron: no caller to scope to; a.workspace_id = b.workspace_id is the constraint that matters here — it keeps a proposed pair inside one workspace
         `SELECT e.source_id, e.target_id,
@@ -363,6 +385,10 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
            AND ABS(a.created_at - b.created_at) >= ?
            AND a.tags NOT LIKE '%"status:deprecated"%'
            AND b.tags NOT LIKE '%"status:deprecated"%'
+           AND (a.valid_until IS NULL OR a.valid_until > ${now})
+           AND (b.valid_until IS NULL OR b.valid_until > ${now})
+           AND ${notHeldSqlFor("a")}
+           AND ${notHeldSqlFor("b")}
          ORDER BY e.created_at DESC
          LIMIT 10`,
       ).bind(MIN_GAP_MS).all() as {
@@ -375,11 +401,15 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
 
       // The deprecation half of eligibility is filtered here, in SQL, rather
       // than left to the JS pass below — because LIMIT 10 runs before that
-      // pass ever sees a row. A system-provenance supersedes edge always
-      // deprecates its target the instant it is created (src/capture/entry.ts
-      // calls deprecateEntry(conflictId) immediately before createEdge(...,
-      // "supersedes", { provenance: "system" })), and system edges outnumber
-      // explicit ones roughly 3:1 and are usually the newest. Unfiltered, an
+      // pass ever sees a row. Before T-0089.2.1 a system-provenance supersedes
+      // edge always deprecated its target the instant it was created; a
+      // contradiction now closes the target's validity window instead
+      // (src/capture/entry.ts, keeping its status and vectors per D2.1), so
+      // the valid_until check above is what excludes it today — the
+      // status:deprecated check still catches the other, still-live
+      // deprecation paths (set_status, insight dismiss, an explicit forget).
+      // System edges outnumber explicit ones roughly 3:1 and are usually the
+      // newest either way. Unfiltered, an
       // `ORDER BY e.created_at DESC LIMIT 10` window fills entirely with rows
       // that isInsightEligible was always going to reject, and the rare
       // user-authored supersedes edge between two still-live entries gets

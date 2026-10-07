@@ -1,13 +1,16 @@
 /**
  * Pins /import's D1 subrequest cost per invocation, driven against real SQLite.
  *
- * The endpoint exists to migrate a brain, and most brains run on the D1 free plan,
- * which allows roughly 50 queries per Worker invocation. The paging design holds
- * the per-call cost flat — one chunked existence lookup plus one insert batch per
- * page, regardless of file size or how far in the cursor is. An earlier version
- * resolved ids lazily, one query per entry and two per edge, which spent the whole
- * budget partway through a real restore (measured: 201 round trips for page 5 of a
- * 5,000-entry export). These tests are what keeps that from coming back.
+ * The endpoint exists to migrate a brain, and this codebase holds itself to a
+ * self-imposed budget of roughly 50 D1 calls per Worker invocation (the
+ * platform's real free-plan ceiling is 1,000 D1/KV/Vectorize calls per
+ * invocation, kept far tighter here for cost and 10 ms-CPU reasons). The
+ * paging design holds the per-call cost flat — one chunked existence lookup
+ * plus one insert batch per page, regardless of file size or how far in the
+ * cursor is. An earlier version resolved ids lazily, one query per entry and
+ * two per edge, which spent the whole self-imposed budget partway through a
+ * real restore (measured: 201 round trips for page 5 of a 5,000-entry
+ * export). These tests are what keeps that from coming back.
  *
  * Counting: `issued` logs one entry per D1 call; the batch shim below collapses a
  * batch's statements into one entry, because DB.batch() is one subrequest in
@@ -63,7 +66,7 @@ const entry = (i: number) => ({
   created_at: 1_700_000_000_000 + i,
 });
 
-describe("/import subrequest budget (D1 free plan: ~50 per invocation)", () => {
+describe("/import subrequest budget (self-imposed D1 budget: ~50 per invocation)", () => {
   it("a fresh default page costs one lookup and one batch", async () => {
     sq = await migrated();
     const entries = Array.from({ length: IMPORT_DEFAULT_LIMIT }, (_, i) => entry(i));
@@ -71,8 +74,12 @@ describe("/import subrequest budget (D1 free plan: ~50 per invocation)", () => {
 
     expect(summary.imported).toBe(IMPORT_DEFAULT_LIMIT);
     expect(sq.rows()).toHaveLength(IMPORT_DEFAULT_LIMIT);
-    // 1 existence lookup (40 ids, one chunk) + 1 insert batch.
-    expect(sq.issued).toHaveLength(2);
+    // MOVED (T-0089.1.2): 2 -> 3. 1 existence lookup (40 ids, one chunk) + 1 trash lookup + 1 insert batch.
+    // MOVED (round 3 re-review MAJOR: "reverse the fresh-id remap"): 4 -> 3, back down --
+    // loadEventHistoryIds is gone. A reused id is kept outright now (no remap decision to make),
+    // and readEntryTimeline's own created_at filter keeps a purged id's old events out of the new
+    // row's history without this module ever needing to see entry_events itself.
+    expect(sq.issued).toHaveLength(3);
   });
 
   it("a late page of a large export costs the same as the first page", async () => {
@@ -89,8 +96,10 @@ describe("/import subrequest budget (D1 free plan: ~50 per invocation)", () => {
     expect(summary.next_offset).toBe(200);
     expect(summary.remaining_entries).toBe(4800);
     expect(sq.rows()).toHaveLength(200);
-    // Position in the file must not change the price: still 1 lookup + 1 batch.
-    expect(sq.issued).toHaveLength(2);
+    // Position in the file must not change the price: still 2 lookups (live, trash) + 1 batch.
+    // MOVED (round 3 re-review MAJOR): 4 -> 3, the same loadEventHistoryIds removal as the
+    // fresh-page test above -- position in the file does not change this price either.
+    expect(sq.issued).toHaveLength(3);
   });
 
   it("an edges-only page stays in single digits", async () => {
@@ -113,7 +122,7 @@ describe("/import subrequest budget (D1 free plan: ~50 per invocation)", () => {
     expect(sq.issued).toHaveLength(3);
   });
 
-  it("a rerun of an already-imported page is one lookup and no writes", async () => {
+  it("a rerun of an already-imported page is two lookups and no writes", async () => {
     sq = await migrated();
     const entries = Array.from({ length: IMPORT_DEFAULT_LIMIT }, (_, i) => entry(i));
     await importExportPayload(envOf(sq), { entries }, {});
@@ -122,7 +131,11 @@ describe("/import subrequest budget (D1 free plan: ~50 per invocation)", () => {
     const summary = await importExportPayload(envOf(sq), { entries }, {});
     expect(summary.skipped).toBe(IMPORT_DEFAULT_LIMIT);
     expect(summary.imported).toBe(0);
-    expect(sq.issued).toHaveLength(1);
+    // MOVED (T-0089.1.2): 1 -> 2, the trash lookup.
+    // Still 2 after round 3's "reverse the fresh-id remap" (loadEventHistoryIds is gone; see the
+    // fresh-page test above) -- every id on this rerun is already live, so flushInsertBatch never
+    // runs at all and there is no insert batch to add a third call.
+    expect(sq.issued).toHaveLength(2);
   });
 });
 

@@ -1,6 +1,10 @@
+import { buildMcpServer } from "../../src/mcp/server";
+import { makeTestEnv } from "../helpers/make-env";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -24,21 +28,20 @@ const ALL_FILES = {
 const FULL_PROVIDERS = ["CLAUDE", "CODEX", "CURSOR"] as const;
 
 /** Every MCP tool a team-aware client should know about. */
-const MCP_TOOLS = [
-  "remember",
-  "recall",
-  "get",
-  "list_recent",
-  "list_teams",
-  "append",
-  "update",
-  "forget",
-  "link",
-  "unlink",
-  "connections",
-  "share",
-  "set_status",
-] as const;
+let MCP_TOOLS: string[];
+beforeAll(async () => {
+  const server = buildMcpServer(makeTestEnv(), { waitUntil: () => {} } as unknown as ExecutionContext);
+  const client = new Client({ name: "instruction-drift", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    MCP_TOOLS = (await client.listTools()).tools.map(tool => tool.name);
+    expect(MCP_TOOLS.length).toBeGreaterThan(0);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
 
 describe("AI instruction files (#223 lazy MCP contract)", () => {
   for (const label of FULL_PROVIDERS) {
@@ -139,4 +142,41 @@ describe("AI instruction files — team workspace coverage", () => {
       }
     }
   });
+});
+
+// Track 2 D4 (T-0089.6.10, spec 14 7.5): time, as-of and retraction explained in plain words,
+// plus D5.3 (cite memory ids) and the held-memory rule against asking for an unread release.
+describe("AI instruction files — time, validity, and D5.3/held-memory rules", () => {
+  for (const label of [...FULL_PROVIDERS, "CHATGPT"] as const) {
+    describe(label, () => {
+      const text = ALL_FILES[label];
+
+      it("explains as_of, valid_from, valid_until and later-retracted results", () => {
+        expect(text).toMatch(/as_of/);
+        expect(text).toMatch(/valid_from/);
+        expect(text).toMatch(/valid_until/);
+        expect(text).toMatch(/later retracted/i);
+      });
+
+      it("tells the agent to cite the memory id it relied on", () => {
+        expect(text).toMatch(/name its id/i);
+      });
+
+      // T-0089.5.3 (05-proof.md Part C): the recall receipt, distinct from a memory id -
+      // it cites the search itself, not one result.
+      it("tells the agent it can cite the recall receipt", () => {
+        expect(text).toMatch(/receipt/i);
+      });
+
+      it("never asks the user to release a held memory they have not read", () => {
+        expect(text).toMatch(/(read what it says|read it themselves)/i);
+      });
+
+      it("documents standing instructions and decisions", () => {
+        expect(text).toMatch(/standing/i);
+        expect(text).toMatch(/decision/i);
+        expect(text).toMatch(/stop_standing/);
+      });
+    });
+  }
 });

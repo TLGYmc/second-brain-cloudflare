@@ -3,6 +3,7 @@ import { DEFAULTS, type Config } from "../config";
 import { CLASSIFY_MAX_TOKENS, LLM_MODEL } from "../constants";
 import { readStreamText } from "../lib/ai";
 import { withKind, type MemoryKind } from "../memory/kind";
+import { hasCapsuleTag } from "../tags/system";
 import { getStatus, withStatus } from "../memory/status";
 
 function normalizeKind(raw: unknown): MemoryKind | null {
@@ -63,15 +64,18 @@ async function applyClassification(
   env: Env,
   { importance, canonical, kind }: { importance: number; canonical: boolean; kind: MemoryKind | null },
 ): Promise<void> {
+  // versioning: exempt: vector bookkeeping — importance is a ranking signal, not undoable content
   await env.DB.prepare(`UPDATE entries SET importance_score = ? WHERE id = ?`).bind(importance, entryId).run();
   if (!kind && !canonical) return;
   // scope-exempt: by-id: the entry this background pass was queued for
   const row = await env.DB.prepare(`SELECT tags FROM entries WHERE id = ?`).bind(entryId).first() as Record<string, any> | null;
   if (!row) return;
-  let tags: string[] = JSON.parse(row.tags ?? "[]");
+  const readTags: string = row.tags ?? "[]";
+  let tags: string[] = JSON.parse(readTags);
   if (kind) tags = withKind(tags, kind);
-  if (canonical && getStatus(tags) === null) tags = withStatus(tags, "canonical");
-  await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(tags), entryId).run();
+  if (canonical && getStatus(tags) === null && !hasCapsuleTag(tags)) tags = withStatus(tags, "canonical");
+  // versioning: exempt: hygiene (T-0089.10), compare-and-set on the tags read; a miss is skipped, not overwritten
+  await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ? AND tags = ?`).bind(JSON.stringify(tags), entryId, readTags).run();
 }
 
 export function scheduleClassifyAndTag(
@@ -106,7 +110,9 @@ export function classifyThenInfer(
   env: Env,
   ctx: ExecutionContext,
   config: Readonly<Config>,
-  infer: (kind: MemoryKind | null) => Promise<void>,
+  // Return value ignored (only .catch() below reads the promise), so a caller
+  // like inferEdgesOnWrite returning a count rather than void still fits.
+  infer: (kind: MemoryKind | null) => Promise<unknown>,
 ): void {
   ctx.waitUntil(
     classifyEntry(content, env, config)

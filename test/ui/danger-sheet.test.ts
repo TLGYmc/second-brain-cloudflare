@@ -74,7 +74,6 @@ function load(missing: string[] = []) {
       body: { style: {}, appendChild() {} },
     },
     fetch: async () => ({ ok: true, json: async () => ({ ok: true }) }),
-    apiMcp: async () => "",
     refreshAll: () => {},
     setTimeout: (fn: () => void) => fn(),
     clearTimeout: () => {},
@@ -188,10 +187,21 @@ describe("memory delete as the first caller", () => {
     const ctx = load();
     ctx.openConfirm("m1", null);
     expect(el(ctx, "confirm-title").textContent).toBe("Forget this memory?");
-    expect(el(ctx, "confirm-body").textContent).toContain("can't be undone");
+    // The confirm tells the truth (it moves to the trash and is recoverable for a
+    // while), not the old "can't be undone" claim.
+    expect(el(ctx, "confirm-body").textContent).toContain("removed for good after the retention period");
     expect(el(ctx, "confirm-accept-btn").textContent).toBe("Forget");
     expect(el(ctx, "confirm-dialog").classList.contains("open")).toBe(true);
     expect(vm.runInContext("pendingForgetId", ctx)).toBe("m1");
+  });
+
+  // Deleting a memory is genuinely irreversible: the one case the sheet's
+  // default (no `tone`) is meant for, unlike the reversible moves and resets
+  // that used to render the same red button regardless.
+  it("renders the accept button as danger, the sheet's default tone", () => {
+    const ctx = load();
+    ctx.openConfirm("m1", null);
+    expect(el(ctx, "confirm-accept-btn").className).toBe("btn-delete");
   });
 
   it("clears the pending memory through the shared close, not a private one", () => {

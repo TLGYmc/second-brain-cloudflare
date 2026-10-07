@@ -1,4 +1,4 @@
-// The "Advanced Settings" window (#246) — the only place Second Brain's
+// The "Advanced Settings" window (#246) - the only place Second Brain's
 // behaviour can be tuned. The Worker stores and reads config; this app is its
 // only writer, which is why there is deliberately no settings UI in the
 // dashboard.
@@ -9,18 +9,19 @@
 // user produce a config that silently snaps back.
 //
 // Edits are STAGED, not written on change. These settings alter how recall
-// behaves, so a mis-click must not silently retune the user's brain — nothing
+// behaves, so a mis-click must not silently retune the user's brain - nothing
 // reaches the Worker until Save, and Cancel discards the batch.
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { h } from "./shared";
 import { LOCALE_CHANGE_EVENT, getLocale, initI18n, t } from "./i18n";
+import { roleFromDetailsProbe, type ConnectionRole } from "./connection-role";
 import "./style.css";
 
 type ControlView = {
   id: string;
   levels: string[];
-  /** null when the stored config matches no level — shown as "Custom". */
+  /** null when the stored config matches no level - shown as "Custom". */
   level: string | null;
   defaultLevel: string;
   forwardOnly: boolean;
@@ -40,7 +41,7 @@ type Staged = { kind: "level"; id: string } | { kind: "reset" };
 
 /**
  * Left-rail sections, mirroring the Connections window. Only the active pane
- * renders — seven controls stacked in one column was a long scroll, and the
+ * renders - seven controls stacked in one column was a long scroll, and the
  * grouping is what tells a user whether a setting affects recall or capture.
  *
  * "ai" holds the two model dropdowns rather than level controls, so it has no
@@ -48,15 +49,19 @@ type Staged = { kind: "level"; id: string } | { kind: "reset" };
  * "matching" is last because it is the only pane that can start something
  * destructive.
  */
-type SectionId = "recall" | "remember" | "ai" | "matching";
+type SectionId = "recall" | "remember" | "history" | "ai" | "matching";
 
 const SECTIONS: {
   id: SectionId;
-  labelKey: "sectionRecall" | "sectionRemember" | "sectionAi" | "sectionMatching";
+  labelKey: "sectionRecall" | "sectionRemember" | "sectionHistory" | "sectionAi" | "sectionMatching";
   controls: string[];
 }[] = [
   { id: "recall", labelKey: "sectionRecall", controls: ["recency", "variety", "connections", "detail"] },
   { id: "remember", labelKey: "sectionRemember", controls: ["duplicates", "compression"] },
+  // Trash retention and versions kept (4.0, UX-D.2). A search-log toggle
+  // (RECALL_LOG) joins this section once T-0089.5.5 lands the config key on
+  // the Worker; there is nothing to render yet, so it is not stubbed here.
+  { id: "history", labelKey: "sectionHistory", controls: ["trash", "versions"] },
   { id: "ai", labelKey: "sectionAi", controls: [] },
   { id: "matching", labelKey: "sectionMatching", controls: [] },
 ];
@@ -66,7 +71,7 @@ let active: SectionId = "recall";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
-/** Last state read from the Worker — the baseline every diff is taken against. */
+/** Last state read from the Worker - the baseline every diff is taken against. */
 let saved: SettingsView | null = null;
 /** Staged edits, keyed by control id. Empty means nothing to save. */
 let staged = new Map<string, Staged>();
@@ -74,6 +79,9 @@ let stagedModel: string | null = null;
 let stagedInsightModel: string | null = null;
 let busy = false;
 let message: { text: string; kind: "ok" | "error" } | null = null;
+/** Determined once at boot (4.0, UX-D.2). PATCH /config is admin-only on the
+ * Worker, so a member can see History and trash but not edit it. */
+let connectionRole: ConnectionRole = "owner";
 
 /** Tauri hands string errors through as strings and everything else as objects. */
 function errorText(e: unknown): string {
@@ -106,7 +114,7 @@ function isDirty(): boolean {
 }
 
 function stage(controlId: string, next: Staged, c: ControlView): void {
-  // Staging back to the saved value is not a change — drop it so Save stays
+  // Staging back to the saved value is not a change - drop it so Save stays
   // disabled and the count stays honest.
   const backToSaved =
     (next.kind === "level" && next.id === c.level) ||
@@ -164,15 +172,15 @@ async function save(): Promise<void> {
 /* ── Rebuilding how memories are read (#248) ─────────────────────────────────
  *
  * Every other control here is a staged radio pick that Save writes. This one is
- * a sequence of Worker-side operations — create, redeploy, re-read in batches,
- * then free the old search data — and the last of those cannot be undone. So it
+ * a sequence of Worker-side operations - create, redeploy, re-read in batches,
+ * then free the old search data - and the last of those cannot be undone. So it
  * is deliberately NOT part of `staged`/`stagedModel`: Save must not be able to
  * commit it, Cancel must not look like it can stop it, and the chosen target
  * must never reach `apply_settings`' patch. Only `begin_embedding_migration`
  * writes it, after the new search data exists.
  *
  * All of it lives at module scope because render() calls app.replaceChildren()
- * on every state change — a progress bar held by reference would be thrown away
+ * on every state change - a progress bar held by reference would be thrown away
  * on the next repaint, exactly as `message` and `busy` are handled.
  *
  * Every state has a way out, which is the property the phase list is arranged
@@ -223,14 +231,14 @@ type MigrationStep = {
   stalled: boolean;
   /**
    * Why it stopped. `"budget"` refills overnight; `"failing"` never will, so the
-   * two need different screens — "come back tomorrow" is advice that can never
+   * two need different screens - "come back tomorrow" is advice that can never
    * work against a memory that keeps failing.
    */
   stalledReason: "budget" | "failing" | null;
 };
 
 type MigrationPhase =
-  /** Pane never opened this session — opening it triggers the first load. */
+  /** Pane never opened this session - opening it triggers the first load. */
   | "unloaded"
   | "loading"
   | "loadFailed"
@@ -261,7 +269,7 @@ type MigrationPhase =
 const migration = {
   phase: "unloaded" as MigrationPhase,
   estimate: null as MigrationEstimate | null,
-  /** The picked target. Not staged — see the note above. */
+  /** The picked target. Not staged - see the note above. */
   target: null as string | null,
   /** Honest k-of-n, straight from the last step's `total - remaining`. */
   progress: null as { done: number; total: number; failed: number } | null,
@@ -288,7 +296,7 @@ function migrationBusy(): boolean {
 }
 
 /**
- * Chunks one batch will embed before it stops — the Worker's
+ * Chunks one batch will embed before it stops - the Worker's
  * MIGRATION_CHUNK_BUDGET. Duplicated here only to turn a piece count into a
  * number of sequential rounds, which is the one honest answer this window can
  * give to "how long will this take". It is shown as "about", so a drift in the
@@ -310,7 +318,7 @@ function levelOf(model: string): string | null {
  * before a one-way operation, and it asked the reader to reason about the
  * position of an opaque string in a list.
  *
- * Falls back to the id only for a model the Worker does not offer — a reader set
+ * Falls back to the id only for a model the Worker does not offer - a reader set
  * outside the app, which must still show as selected rather than vanish.
  */
 function levelName(model: string): string {
@@ -337,7 +345,7 @@ function levelNotice(model: string): string | null {
  *
  * Asked of the Worker side rather than tracked here: it is recorded from what
  * Cloudflare reported as bound, so it survives a restart and cannot name the
- * wrong thing. A failure reads as "nothing to free" — offering the step without
+ * wrong thing. A failure reads as "nothing to free" - offering the step without
  * a name behind it is how the wrong data gets deleted.
  */
 async function refreshOldIndex(): Promise<void> {
@@ -359,7 +367,7 @@ async function loadMigration(forcePicker = false): Promise<void> {
   try {
     const status = await invoke<MigrationStatus>("migration_status");
     // A status the Worker itself calls not-ok must not be read as "no rebuild in
-    // progress" — that would offer a fresh start over the top of a live one.
+    // progress" - that would offer a fresh start over the top of a live one.
     if (!status.ok) {
       migration.phase = "loadFailed";
       migration.error = null;
@@ -479,7 +487,7 @@ async function stepLoop(): Promise<void> {
       lastRemaining = step.remaining;
       if (idleRounds >= 2) {
         // Its own phase rather than an error string stacked under the failed
-        // screen, which said the same thing twice in two voices — three lines of
+        // screen, which said the same thing twice in two voices - three lines of
         // calm grey reassurance and then a red sentence arguing with them.
         migration.phase = "stuck";
         migration.error = null;
@@ -507,7 +515,7 @@ async function resumeMigration(): Promise<void> {
  * the first memory.
  *
  * Without it, a rebuild whose cursor sits on a permanently failing memory has no
- * exit at all — every Carry on reruns the same batch. It costs AI allowance for
+ * exit at all - every Carry on reruns the same batch. It costs AI allowance for
  * work already paid for once, which is why the screens that offer it say so.
  *
  * It does not land on the picker afterwards. The brain is already reading the new
@@ -593,7 +601,7 @@ function migrationButton(
 /**
  * Not rendered on the done screen at all, which is why `failed` never appears
  * there. `failed` is cumulative and a memory that failed one batch is retried in
- * a later one, so finishing with a non-zero count is an ordinary outcome — and
+ * a later one, so finishing with a non-zero count is an ordinary outcome - and
  * "couldn't be read: 3" under the heading "all your memories have been read
  * again" would contradict itself, with the alarming half carrying the number.
  */
@@ -646,8 +654,8 @@ function migrationPicker(e: MigrationEstimate): HTMLElement[] {
   select.value = migration.target ?? e.currentModel;
 
   // The one warning that is about a hard limit rather than a cost. On the free
-  // plan, running out of stored space makes writes fail — there is no billing to
-  // absorb it — and the peak comes during the rebuild, while both the old and new
+  // plan, running out of stored space makes writes fail - there is no billing to
+  // absorb it - and the peak comes during the rebuild, while both the old and new
   // search data are kept so the change can still be undone.
   const storageWarning = () => {
     const target = select.value;
@@ -705,8 +713,8 @@ function migrationPicker(e: MigrationEstimate): HTMLElement[] {
 
 function migrationConfirm(): HTMLElement[] {
   const e = migration.estimate;
-  const chunks = e ? num(e.chunksAtLeast) : "—";
-  const rounds = e ? num(roundsFor(e.chunksAtLeast)) : "—";
+  const chunks = e ? num(e.chunksAtLeast) : t("settingsPanel.migration.unknownValue");
+  const rounds = e ? num(roundsFor(e.chunksAtLeast)) : t("settingsPanel.migration.unknownValue");
   const points = h("ul", { class: "settings-migration-points" });
   for (const key of ["point1", "point2", "point3", "point4"] as const) {
     points.append(h("li", {}, [t(`settingsPanel.migration.${key}`, { chunks, rounds })]));
@@ -849,7 +857,7 @@ function migrationBody(): HTMLElement[] {
     case "running": {
       // The copy has always said closing the window is a safe pause, and then
       // beforeunload argued about closing it. A real Pause is the exit that
-      // settles the contradiction — and it stays enabled while everything else
+      // settles the contradiction - and it stays enabled while everything else
       // on the screen is locked.
       const pause = migrationButton(
         "btn-ghost",
@@ -973,7 +981,13 @@ function migrationCard(): HTMLElement {
   return card;
 }
 
-function controlCard(c: ControlView): HTMLElement {
+/**
+ * `readOnly` is separate from `locked()`: locked is a temporary, whole-window
+ * state (a save or rebuild in flight), while read-only is per-control and
+ * durable for the session - a member can see History and trash the entire
+ * time this window is open, never just while something else is busy.
+ */
+function controlCard(c: ControlView, readOnly = false): HTMLElement {
   // Typed so the dotted keys below still satisfy t()'s Path type rather
   // than widening to a bare string.
   const base: `settingsPanel.${string}` = `settingsPanel.${c.id}`;
@@ -995,19 +1009,26 @@ function controlCard(c: ControlView): HTMLElement {
 
   const group = h("div", { class: "settings-levels", role: "radiogroup" });
   group.setAttribute("aria-label", t(`${base}.label`));
+  // Screen readers get this from the group; a sighted member gets it from the
+  // banner above the section (render()) plus the non-interactive pill style
+  // below - the pointer cursor a disabled <input> leaves on its label was the
+  // part that still read as clickable.
+  if (readOnly) group.setAttribute("aria-readonly", "true");
 
   for (const levelId of c.levels) {
     const input = h("input", { type: "radio", name: `sb-${c.id}`, value: levelId });
     (input as HTMLInputElement).checked = shown === levelId;
-    (input as HTMLInputElement).disabled = locked();
+    (input as HTMLInputElement).disabled = locked() || readOnly;
     input.addEventListener("change", () => stage(c.id, { kind: "level", id: levelId }, c));
-    const label = h("label", { class: "settings-level" }, [
+    const label = h("label", { class: `settings-level${readOnly ? " settings-level-readonly" : ""}` }, [
       input,
       t(`${base}.levels.${levelId}.name`),
     ]);
-    // Hovering previews that level's notice; leaving restores the shown one.
-    label.addEventListener("mouseenter", () => paint(levelId));
-    label.addEventListener("mouseleave", () => paint(shown));
+    if (!readOnly) {
+      // Hovering previews that level's notice; leaving restores the shown one.
+      label.addEventListener("mouseenter", () => paint(levelId));
+      label.addEventListener("mouseleave", () => paint(shown));
+    }
     group.append(label);
   }
   card.append(group);
@@ -1024,20 +1045,26 @@ function controlCard(c: ControlView): HTMLElement {
     card.append(h("div", { class: "settings-forward-note" }, [`ⓘ ${t(`${base}.note`)}`]));
   }
 
-  const reset = h("button", { class: "btn-secondary settings-reset", type: "button" }, [
-    t("settingsPanel.reset"),
-  ]);
-  // Reset is itself staged, so it can be cancelled like any other edit.
-  (reset as HTMLButtonElement).disabled = locked() || shown === c.defaultLevel;
-  reset.addEventListener("click", () => stage(c.id, { kind: "reset" }, c));
-  card.append(reset);
+  // Hidden, not disabled, in both cases it has nothing to do: a read-only
+  // member has nothing on this card to change, and a value already at its
+  // default has nothing to reset. An inert button under "The default. ..."
+  // is a control with no purpose, not a clearly unavailable one.
+  if (!readOnly && shown !== c.defaultLevel) {
+    const reset = h("button", { class: "btn-secondary settings-reset", type: "button" }, [
+      t("settingsPanel.reset"),
+    ]);
+    // Reset is itself staged, so it can be cancelled like any other edit.
+    (reset as HTMLButtonElement).disabled = locked();
+    reset.addEventListener("click", () => stage(c.id, { kind: "reset" }, c));
+    card.append(reset);
+  }
 
   return card;
 }
 
 /**
  * Both model dropdowns (LLM_MODEL and INSIGHT_LLM_MODEL) draw from the same
- * curated catalogue and show the id itself — there is no friendly-name layer
+ * curated catalogue and show the id itself - there is no friendly-name layer
  * for these the way the migration picker has for embedding models, so the
  * option text is the id.
  */
@@ -1175,23 +1202,41 @@ function render(): void {
   pane.append(
     h("h2", { class: "pane-title" }, [t(`settingsPanel.${section.labelKey}`)]),
     h("p", { class: "settings-lede" }, [
-      // The shared lede promises "applies to your next search", which is not
-      // what a rebuild does. That pane says what it actually does.
-      active === "matching" ? t("settingsPanel.migration.lede") : t("settingsPanel.lede"),
+      // The shared lede promises "applies to your next search", which is
+      // true for neither of these panes: a rebuild has its own sequence, and
+      // trash length and versions kept take effect on different schedules
+      // (tonight's cleanup vs. a memory's next edit) - so each states its own.
+      active === "matching"
+        ? t("settingsPanel.migration.lede")
+        : active === "history"
+          ? t("settingsPanel.historyLede")
+          : t("settingsPanel.lede"),
     ]),
   );
+
+  // Members can see History and trash but PATCH /config is admin-only on the
+  // Worker, so their controls render read-only with a line saying why.
+  const historyReadOnly = section.id === "history" && connectionRole === "member";
+  if (historyReadOnly) {
+    pane.append(h("p", { class: "settings-notice" }, [t("settingsPanel.historyReadOnly")]));
+  }
 
   const byId = new Map(saved.controls.map(c => [c.id, c]));
   for (const id of section.controls) {
     const c = byId.get(id);
     // Skip silently rather than throwing: a Worker running an older version
     // may not expose every control yet.
-    if (c) pane.append(controlCard(c));
+    if (c) pane.append(controlCard(c, historyReadOnly));
   }
   if (active === "ai") pane.append(modelCard(saved), insightModelCard(saved));
   if (active === "matching") pane.append(migrationCard());
 
-  app.append(h("div", { class: "panel" }, [rail, pane]), actionBar());
+  // A member has nothing to save on a fully read-only section. The bar stays
+  // if something IS staged (on another section they can edit), since it
+  // would otherwise hide a real pending change - "nothing to save" only
+  // holds when that is actually true.
+  const nothingToSaveHere = historyReadOnly && !isDirty();
+  app.append(h("div", { class: "panel" }, [rail, pane]), ...(nothingToSaveHere ? [] : [actionBar()]));
   // Re-render replaces the whole tree; without this, staging an edit near the
   // bottom would jump the view back to the top.
   window.scrollTo({ top: scroll });
@@ -1214,6 +1259,16 @@ async function boot(): Promise<void> {
   app.replaceChildren(h("p", { class: "settings-lede" }, [t("settingsPanel.saving")]));
   try {
     saved = await invoke<SettingsView>("get_brain_settings");
+    try {
+      const details = await invoke<{ teamMode: boolean }>("get_connection_details");
+      const probe = details.teamMode ? await invoke<unknown>("connection_role").catch(() => null) : null;
+      connectionRole = roleFromDetailsProbe(details.teamMode, probe);
+    } catch {
+      // Role could not be determined. Read-only is the safer wrong guess:
+      // hiding an edit control from someone allowed to use it is a smaller
+      // mistake than letting a member stage a change the Worker will 403.
+      connectionRole = "member";
+    }
     render();
   } catch (e) {
     app.replaceChildren(
@@ -1227,7 +1282,7 @@ async function boot(): Promise<void> {
 
 // Closing the window with staged edits would lose them silently. Closing it
 // mid-rebuild stops the batch loop, which leaves the brain searchable but
-// incomplete until someone comes back and resumes — also worth a warning.
+// incomplete until someone comes back and resumes - also worth a warning.
 window.addEventListener("beforeunload", event => {
   if (isDirty() || migrationBusy()) event.preventDefault();
 });
